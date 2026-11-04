@@ -1,0 +1,59 @@
+# Source files are included by default: frontend/, backend/src/, tests/, infra/,
+# docs/, Python modules, startup scripts, dependency manifests and lockfiles.
+# Keep README.md, LICENSE, AGENTS.md, .github/, .dockerignore and this file.
+
+# Real credentials and machine-specific configuration; keep the public template.
+.env
+.env.*
+!.env.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+.aws/
+.ssh/
+
+# Local databases, chat uploads, workspaces, evaluation data/reports and tools.
+/data/
+/.tools/
+.team/
+.tasks/
+.transcripts/
+.cache/
+
+# Python environments, bytecode and test/tool caches.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Frontend dependencies and generated assets; keep package-lock.json.
+node_modules/
+/frontend/dist/
+coverage/
+*.tsbuildinfo
+
+# Java compilation, packaged applications and test reports.
+/backend/target/
+*.class
+
+# Personal editor/agent settings and operating-system temporary files.
+.idea/
+.vscode/
+.codex/
+.agents/
+*.iml
+*.swp
+*.swo
+*~
+*.log
+.DS_Store
+Thumbs.db
+Desktop.ini

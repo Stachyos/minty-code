@@ -1,0 +1,4 @@
+anthropic>=0.25.0
+python-dotenv>=1.0.0
+Brotli>=1.2.0; platform_python_implementation == "CPython"
+brotlicffi>=1.2.0.2; platform_python_implementation != "CPython"

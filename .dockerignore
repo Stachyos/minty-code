@@ -1,0 +1,15 @@
+.git
+.idea
+.vscode
+.venv
+.env
+.env.*
+!.env.example
+.tools
+data
+**/__pycache__
+**/*.pyc
+**/node_modules
+**/dist
+**/target
+**/.DS_Store
