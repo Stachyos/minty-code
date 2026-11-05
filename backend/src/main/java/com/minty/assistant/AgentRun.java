@@ -15,6 +15,8 @@ public class AgentRun {
     @Column(columnDefinition = "text") public String error;
     public long inputTokens;
     public long outputTokens;
+    @Column(columnDefinition = "text") public String verification;
+    @Column(columnDefinition = "text") public String changes;
     @Column(nullable = false) public Instant createdAt;
     public Instant finishedAt;
     protected AgentRun() {}

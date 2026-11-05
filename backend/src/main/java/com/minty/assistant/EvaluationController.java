@@ -13,6 +13,7 @@ public class EvaluationController {
     EvaluationController(EvaluationService service) { this.service = service; }
     @GetMapping("/environment") public Object environment() { return service.environment(); }
     @GetMapping("/catalog") public Object catalog() throws IOException, InterruptedException { return service.catalog(); }
+    @GetMapping("/suites") public Object suites() throws IOException { return service.suites(); }
     @GetMapping public Object list() { return service.list(); }
     @PostMapping("/setup") public Object setup() throws IOException { return service.start(null, true); }
     @PostMapping public Object start(@Valid @RequestBody Request request) throws IOException { return service.start(request, false); }
@@ -25,5 +26,6 @@ public class EvaluationController {
     public record Request(@NotBlank @Size(max=100) String name, @Min(1) @Max(300) int limit,
                           @Size(max=300) List<@Pattern(regexp="[A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+-[0-9]+") String> instanceIds,
                           @Min(1) @Max(40) int maxSteps, @Min(60) @Max(7200) int timeoutSeconds,
-                          @Min(60) @Max(7200) int testTimeoutSeconds) {}
+                          @Min(60) @Max(7200) int testTimeoutSeconds,
+                          @Pattern(regexp="[a-zA-Z0-9-]*") String suiteId) {}
 }

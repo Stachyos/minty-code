@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "test": "node --test src/workflow.test.js src/workflowLoop.test.js src/chapterModules.test.js",
+    "test": "node --test src/workflow.test.js src/workflowLoop.test.js src/chapterModules.test.js src/evaluationComparison.test.js",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1"
   },

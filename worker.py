@@ -10,6 +10,7 @@ import signal
 from pathlib import Path
 import subprocess
 import sys
+from coding_tools import CodingTools, LifecycleHooks, TOOL_SCHEMAS
 
 
 def emit(kind: str, content: str = "", **extra) -> None:
@@ -61,16 +62,22 @@ def load_core(workspace: Path, model: str):
     return core
 
 
-def execute(request: dict, core, workspace: Path, *, shell_handler=None, system_override=None) -> None:
+def execute(request: dict, core, workspace: Path, *, shell_handler=None, system_override=None, coding=None, hooks=None) -> None:
     prompt = str(request.get("prompt", "")).strip()
     if not prompt:
         raise ValueError("任务内容不能为空")
     allowed = {"read_file", "write_file", "edit_file", "TodoWrite", "task_create",
                "task_get", "task_update", "task_list", "load_skill", "compress"}
+    if coding is not None:
+        allowed.update(tool['name'] for tool in TOOL_SCHEMAS)
     if os.getenv("AGENT_ALLOW_SHELL", "false").lower() == "true":
         allowed.add("bash")
     tools = [tool for tool in core.TOOLS if tool["name"] in allowed]
     handlers = {name: handler for name, handler in core.TOOL_HANDLERS.items() if name in allowed}
+    if coding is not None:
+        coding_names = {tool['name'] for tool in TOOL_SCHEMAS}
+        tools = [tool for tool in tools if tool['name'] not in coding_names] + TOOL_SCHEMAS
+        handlers.update(coding.handlers)
     handlers["bash"] = shell_handler or (lambda command: shell_command(workspace, command))
     messages = [{"role": item["role"], "content": str(item["content"])}
                 for item in request.get("history", [])[-30:]
@@ -88,6 +95,33 @@ def execute(request: dict, core, workspace: Path, *, shell_handler=None, system_
               f"Available skills: {core.SKILLS.descriptions()}")
     if system_override is not None:
         system = system_override
+    if coding is not None:
+        system += (' For coding tasks: inspect with list_files/search_text/read_file; prefer apply_patch using file sha256. '
+                   'Run relevant tests with run_tests after the final edit and inspect get_diff. Do not edit tests or test configuration to make a fix pass. '
+                   'run_tests uses isolation and is available even when host shell is disabled. '
+                   'A model reply does not prove success: an independent completion check reports the actual evidence. '
+                   'If tests are unavailable, say the result is unverified. Do not claim all requirements are satisfied from a small test alone.')
+    hooks = hooks or LifecycleHooks()
+    def fire_hook(name, **context):
+        hooks.fire(name, **context)
+        emit_detail('hook', hook=name, status='completed', **{key: value for key, value in context.items() if key in {'tool', 'round', 'outcome'}})
+    fire_hook('input', prompt=prompt)
+    verification_retries = 0
+    def result_event(name, arguments, identity, round_number):
+        emit_detail('tool_start', name=name, input=arguments, toolUseId=identity, round=round_number)
+        fire_hook('before_tool', tool=name, round=round_number, arguments=arguments)
+        result = handlers[name](**arguments)
+        output = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
+        failed = isinstance(result, dict) and result.get('ok') is False or output.startswith('Error:')
+        fire_hook('after_tool', tool=name, round=round_number, result=result)
+        emit_detail('tool_result', name=name, output=output[:40000], toolUseId=identity, round=round_number, status='failed' if failed else 'completed')
+        return result
+    def final_assessment():
+        assessment = coding.assessment()
+        emit_detail('verification', **assessment)
+        coding.reported = True
+        fire_hook('stop', outcome=assessment['outcome'], assessment=assessment)
+        return assessment
     emit_detail("phase", phaseId="prepare", phase="prepare", label="准备任务", status="completed")
     for round_number in range(1, max_steps + 1):
         emit_detail("phase", phaseId=f"context-{round_number}", phase="context",
@@ -118,13 +152,33 @@ def execute(request: dict, core, workspace: Path, *, shell_handler=None, system_
         if not calls:
             if response.stop_reason == "max_tokens":
                 raise RuntimeError("回答达到单轮长度上限，请缩小任务后重试。")
-            emit("done", "任务完成")
+            if coding is not None:
+                emit_detail('phase', phase='verification', phaseId=f'verify-{round_number}', label='检查修改与测试证据', status='running', round=round_number)
+                assessment = coding.assessment()
+                if assessment['changedFiles'] and not assessment['testsCurrent']:
+                    suggested = coding.suggested_test()
+                    if suggested:
+                        result_event('run_tests', suggested, f'auto-test-{round_number}', round_number)
+                        assessment = coding.assessment()
+                emit_detail('phase', phase='verification', phaseId=f'verify-{round_number}', label='检查修改与测试证据', status='completed', round=round_number)
+                retryable = assessment['outcome'] == 'validation_failed' or assessment['outcome'] == 'unverified' and assessment['testsCurrent'] and assessment['modifiedTests']
+                if retryable and verification_retries < 2 and round_number < max_steps:
+                    verification_retries += 1
+                    emit_detail('completion_check', status='continue', reason=assessment['reason'], attempt=verification_retries)
+                    messages.append({'role': 'user', 'content': '[Independent verification] ' + json.dumps({key: assessment[key] for key in ['outcome','reason','tests','modifiedTests']}, ensure_ascii=False)
+                                     + '\nFix the implementation and re-run relevant tests. Restore changes that weaken existing tests. Stay within the original request.'})
+                    continue
+                final_assessment()
+            else:
+                fire_hook('stop', outcome='no_verification_data')
+            emit("done", "本次执行已结束；请以验证结果为准")
             return
         results = []
         compress = False
         for call in calls:
             emit_detail("tool_start", name=call.name, input=call.input,
                         toolUseId=call.id, round=round_number)
+            result = None
             try:
                 if call.name not in allowed:
                     raise ValueError("This tool is unavailable in the web application")
@@ -133,15 +187,22 @@ def execute(request: dict, core, workspace: Path, *, shell_handler=None, system_
                     path = core.safe_path(call.input["path"])
                     if any(part.startswith(".") for part in path.relative_to(workspace).parts):
                         raise ValueError("Hidden/configuration files are not accessible through web tools")
+                fire_hook('before_tool', tool=call.name, round=round_number, arguments=call.input)
                 with contextlib.redirect_stdout(sys.stderr):
-                    output = str(handlers[call.name](**call.input))[:40000]
+                    result = handlers[call.name](**call.input)
+                    output = (json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result))[:40000]
+                failed = isinstance(result, dict) and result.get('ok') is False or output.startswith('Error:')
+                if coding is not None and call.name in {'write_file', 'edit_file', 'apply_patch'} and not failed:
+                    emit_detail('changes', **coding.get_diff())
                 compress = compress or call.name == "compress"
             except Exception as exc:
                 output = f"Error: {exc}"
+                failed = True
+            fire_hook('after_tool', tool=call.name, round=round_number, result=result, failed=failed)
             emit_detail("tool_result", name=call.name, output=output, toolUseId=call.id,
-                        round=round_number, status="failed" if output.startswith("Error:") else "completed")
+                        round=round_number, status="failed" if failed else "completed")
             results.append({"type": "tool_result", "tool_use_id": call.id,
-                            "content": output, "is_error": output.startswith("Error:")})
+                            "content": output, "is_error": bool(failed)})
         emit_detail("phase", phaseId=f"feedback-{round_number}", phase="feedback",
                     label="回填工具结果", status="running", round=round_number,
                     toolCalls=len(results))
@@ -151,6 +212,8 @@ def execute(request: dict, core, workspace: Path, *, shell_handler=None, system_
                     toolCalls=len(results))
         if compress:
             messages = compact(core, messages, model, f"compact-after-{round_number}")
+    if coding is not None:
+        final_assessment()
     raise RuntimeError(f"已达到 {max_steps} 轮工具调用上限；可以继续发送消息处理剩余任务。")
 
 
@@ -169,6 +232,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace", required=True)
     args = parser.parse_args()
+    coding = None
     try:
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(encoding="utf-8")
@@ -180,9 +244,13 @@ def main() -> int:
         if not key or key in {"your-api-key", "sk-ant-xxx"}:
             raise ValueError("请先在项目根目录 .env 中配置有效的 ANTHROPIC_API_KEY")
         core = load_core(workspace, request.get("model") or os.getenv("MODEL_ID", "claude-sonnet-4-6"))
-        execute(request, core, workspace)
+        coding = CodingTools(workspace, request.get('runId'), notify=emit_detail)
+        execute(request, core, workspace, coding=coding)
         return 0
     except Exception as exc:
+        if coding is not None and not getattr(coding, 'reported', False):
+            try: emit_detail('verification', **coding.assessment())
+            except Exception: pass
         # No traceback or request headers are exposed to the UI.
         message = str(exc)
         key = os.getenv("ANTHROPIC_API_KEY", "")

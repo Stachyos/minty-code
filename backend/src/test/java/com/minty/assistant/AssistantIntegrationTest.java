@@ -53,6 +53,9 @@ class AssistantIntegrationTest {
                     for event in [
                       {'type':'tool_start','content':json.dumps({'name':'write_file','input':{'path':'hello.txt'},'toolUseId':'fixture-tool-1','round':1})},
                       {'type':'tool_result','content':json.dumps({'name':'write_file','output':'OK','toolUseId':'fixture-tool-1','round':1,'status':'completed'})},
+                      {'type':'hook','content':json.dumps({'hook':'stop','status':'completed'})},
+                      {'type':'changes','content':json.dumps({'totalFiles':1,'files':[{'path':'hello.txt','kind':'created','patch':'+hello from agent'}]})},
+                      {'type':'verification','content':json.dumps({'outcome':'unverified','reason':'No tests executed','changedFiles':1,'tests':None})},
                       {'type':'text','content':'Finished!'},
                       {'type':'done','content':''}]:
                         print(json.dumps(event), flush=True)
@@ -79,6 +82,8 @@ class AssistantIntegrationTest {
         assertThat(finished.outputTokens).isEqualTo(7);
         assertThat(finished.prompt).isEqualTo("write a greeting");
         assertThat(finished.model).isEqualTo("fixture-model");
+        assertThat(json.readTree(finished.verification).path("outcome").asText()).isEqualTo("unverified");
+        assertThat(json.readTree(finished.changes).path("totalFiles").asInt()).isEqualTo(1);
         assertThat(agent.requireSession(session.id).title).isEqualTo("write a greeting");
         List<?> messages = (List<?>) agent.session(session.id).get("messages");
         assertThat(messages).hasSize(2);
@@ -184,6 +189,7 @@ class AssistantIntegrationTest {
         mvc.perform(post("/api/sessions").header("Origin", "https://untrusted.example").contentType(MediaType.APPLICATION_JSON).content("{}"))
                 .andExpect(status().isForbidden());
         mvc.perform(get("/api/status")).andExpect(status().isOk()).andExpect(jsonPath("$.configured").value(true))
+                .andExpect(jsonPath("$.databaseReady").value(true)).andExpect(jsonPath("$.ready").value(true))
                 .andExpect(jsonPath("$.apiKey").doesNotExist());
     }
     @Test void uploadAcceptsUtf8CodeAndRejectsEscapeBinaryAndActiveRunWrites() throws Exception {

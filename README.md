@@ -97,6 +97,16 @@ npm run dev
 
 ## 使用
 
+第一阶段新增代码目录导入、`list_files` / `search_text` / `apply_patch` / `get_diff` / `run_tests` 工具、独立验证结果和固定评测题集。具体用法、测试隔离边界、支持的语言与 S01—S17 状态见 [第一阶段说明](docs/stage1.md)。
+
+如果网页能打开但历史记录加载失败，先检查本地 PostgreSQL 是否运行。前端和后端仍在运行时，可单独恢复原数据库，不必停止应用：
+
+```powershell
+.\start-dev.ps1 -DatabaseOnly
+```
+
+该模式只连接已有的 `data/pgdata` 和 `minty` 数据库，不会创建空数据库替代原数据。恢复后网页会定期检查连接并重新加载历史列表，也可点击「重新连接」。本地数据库与 Docker Compose 数据库各自保存数据，启动 Docker Desktop 本身不会启动本地 PostgreSQL。
+
 ### SWE-bench Lite 真实评测
 
 在侧栏进入「Agent 评测」。这是本地开发模式的评测功能，网页和数据库仍按原方式运行；只有题目执行和官方评分使用 Docker Desktop 的 Linux 引擎。现有 Docker Compose 应用容器没有挂载 Docker 引擎，不支持从该部署模式直接发起评测。

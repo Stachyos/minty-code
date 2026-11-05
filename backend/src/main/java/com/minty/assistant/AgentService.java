@@ -19,6 +19,7 @@ import java.util.concurrent.*;
 @Service
 public class AgentService {
     private final AgentProperties config;
+    private final DatabaseHealth database;
     private final SessionRepository sessions;
     private final MessageRepository messages;
     private final RunRepository runs;
@@ -33,8 +34,9 @@ public class AgentService {
 
     AgentService(AgentProperties config, SessionRepository sessions, MessageRepository messages,
                  RunRepository runs, EventRepository events, WorkspaceService workspaces, ObjectMapper json,
-                 PlatformTransactionManager transactionManager) {
+                 PlatformTransactionManager transactionManager, DatabaseHealth database) {
         this.config = config; this.sessions = sessions; this.messages = messages;
+        this.database = database;
         this.runs = runs; this.events = events; this.workspaces = workspaces; this.json = json;
         this.workers = Executors.newFixedThreadPool(Math.max(1, config.maxConcurrentRuns()));
         this.transactions = new TransactionTemplate(transactionManager);
@@ -47,7 +49,10 @@ public class AgentService {
         }
     }
     public Map<String, Object> status() {
+        boolean databaseReady = database.ready();
         return Map.of("configured", config.configured(), "model", config.model(), "running", jobs.size(),
+                "databaseReady", databaseReady, "ready", databaseReady && config.configured(),
+                "message", databaseReady ? "" : "数据库暂时无法连接，历史记录当前无法读取。请检查本地数据库是否已启动。",
                 "shellEnabled", config.allowShell(), "maxSteps", config.maxSteps(), "timeoutSeconds", config.timeoutSeconds());
     }
     public List<ChatSession> sessions() { return sessions.findAllByOrderByUpdatedAtDesc(); }
@@ -134,7 +139,7 @@ public class AgentService {
             }, "agent-stderr-" + job.id);
             errorReader.setDaemon(true); errorReader.start();
             try (Writer input = new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8)) {
-                json.writeValue(input, Map.of("prompt", prompt, "history", history, "model", config.model(), "maxSteps", Math.max(1, config.maxSteps())));
+                json.writeValue(input, Map.of("prompt", prompt, "history", history, "model", config.model(), "maxSteps", Math.max(1, config.maxSteps()), "runId", job.id));
             }
             boolean done = false;
             String workerError = null;
@@ -149,7 +154,15 @@ public class AgentService {
                         String content = redact(node.path("content").isTextual() ? node.path("content").asText() : node.path("content").toString());
                         switch (type) {
                             case "text" -> { job.text.append(content); event(job.id, type, content); }
-                            case "tool_start", "tool_result", "model_start", "model_end", "phase" -> event(job.id, type, content);
+                            case "tool_start", "tool_result", "model_start", "model_end", "phase", "hook", "completion_check" -> {
+                                if (type.equals("tool_start") && json.readTree(content).path("name").asText().equals("run_tests")) job.testsUsed = true;
+                                event(job.id, type, content);
+                            }
+                            case "verification", "changes" -> {
+                                AgentRun observed = requireRun(job.id);
+                                if (type.equals("verification")) observed.verification = content; else observed.changes = content;
+                                runs.save(observed); event(job.id, type, content);
+                            }
                             case "usage" -> {
                                 job.inputTokens += Math.max(0, node.path("inputTokens").asLong());
                                 job.outputTokens += Math.max(0, node.path("outputTokens").asLong());
@@ -178,6 +191,7 @@ public class AgentService {
             if (e instanceof InterruptedException) Thread.currentThread().interrupt();
         } finally {
             timeout.cancel(false); kill(job.process);
+            if (job.testsUsed) cleanupTests(job.id);
             jobs.remove(job.id); activeSessions.remove(job.sessionId, job.id);
         }
     }
@@ -227,6 +241,18 @@ public class AgentService {
         descendants.forEach(p -> { if (p.isAlive()) p.destroyForcibly(); });
         if (process.isAlive()) process.destroyForcibly();
     }
+    private void cleanupTests(String id) {
+        try {
+            Process scan = new ProcessBuilder("docker", "ps", "-aq", "--filter", "label=minty.run=" + id).redirectError(ProcessBuilder.Redirect.DISCARD).start();
+            if (!scan.waitFor(5, TimeUnit.SECONDS)) { scan.destroyForcibly(); return; }
+            for (String container : new String(scan.getInputStream().readAllBytes(), StandardCharsets.UTF_8).split("\\s+")) {
+                if (!container.matches("[a-f0-9]{12,64}")) continue;
+                Process removal = new ProcessBuilder("docker", "rm", "-f", container).redirectOutput(ProcessBuilder.Redirect.DISCARD).redirectError(ProcessBuilder.Redirect.DISCARD).start();
+                if (!removal.waitFor(10, TimeUnit.SECONDS)) removal.destroyForcibly();
+            }
+        } catch (IOException ignored) { /* No Docker is needed for file-only runs. */ }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
     public Map<String, Object> stats() {
         List<AgentRun> all = runs.findAllByOrderByCreatedAtAsc();
         long total = all.stream().mapToLong(r -> r.inputTokens + r.outputTokens).sum();
@@ -250,7 +276,7 @@ public class AgentService {
         final String id, sessionId;
         final StringBuilder text = new StringBuilder();
         Process process;
-        boolean cancelled, finished;
+        boolean cancelled, finished, testsUsed;
         String reportedError;
         long inputTokens, outputTokens;
         Job(String id, String sessionId) { this.id = id; this.sessionId = sessionId; }

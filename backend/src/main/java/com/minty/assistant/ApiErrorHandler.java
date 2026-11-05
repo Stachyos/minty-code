@@ -22,6 +22,13 @@ public class ApiErrorHandler {
     ResponseEntity<?> invalid(Exception e) { return ResponseEntity.badRequest().body(Map.of("message", "请求参数或 JSON 格式无效")); }
     @ExceptionHandler(org.springframework.web.multipart.MaxUploadSizeExceededException.class)
     ResponseEntity<?> uploadTooLarge(Exception e) { return ResponseEntity.badRequest().body(Map.of("message", "单个文件不能超过 1 MB")); }
+    @ExceptionHandler({org.springframework.dao.DataAccessResourceFailureException.class,
+            org.springframework.transaction.CannotCreateTransactionException.class})
+    ResponseEntity<?> databaseUnavailable(Exception e) {
+        log.warn("Database unavailable: {}", e.getClass().getSimpleName());
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(Map.of("code", "DATABASE_UNAVAILABLE",
+                "message", "数据库暂时无法连接，历史记录当前无法读取。请检查本地数据库是否已启动。"));
+    }
     @ExceptionHandler(Exception.class)
     ResponseEntity<?> unexpected(Exception e) {
         log.warn("Request failed: {}", e.getClass().getSimpleName());

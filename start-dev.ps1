@@ -1,4 +1,4 @@
-param([switch]$SkipBuild, [switch]$Stop)
+param([switch]$SkipBuild, [switch]$Stop, [switch]$DatabaseOnly)
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 
@@ -37,33 +37,35 @@ Get-Content -LiteralPath '.env' | ForEach-Object {
         [Environment]::SetEnvironmentVariable($Matches[1], $value, 'Process')
     }
 }
-foreach ($portToCheck in @(8080, 5173)) {
-    $listener = Get-NetTCPConnection -State Listen -LocalPort $portToCheck -ErrorAction SilentlyContinue
-    if ($listener) { throw "Port $portToCheck is already in use. Stop the existing service before starting another development instance." }
-}
+if (-not $DatabaseOnly) {
+    foreach ($portToCheck in @(8080, 5173)) {
+        $listener = Get-NetTCPConnection -State Listen -LocalPort $portToCheck -ErrorAction SilentlyContinue
+        if ($listener) { throw "Port $portToCheck is already in use. Stop the existing service before starting another development instance." }
+    }
 
-if (-not $env:JAVA_HOME -or -not (Test-Path -LiteralPath "$env:JAVA_HOME/bin/java.exe")) {
-    $jdk = Get-ChildItem -LiteralPath "$env:USERPROFILE/.jdks" -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '17|21' -and (Test-Path -LiteralPath "$($_.FullName)/bin/javac.exe") } |
-        Sort-Object Name -Descending | Select-Object -First 1
-    if ($jdk) { $env:JAVA_HOME = $jdk.FullName }
+    if (-not $env:JAVA_HOME -or -not (Test-Path -LiteralPath "$env:JAVA_HOME/bin/java.exe")) {
+        $jdk = Get-ChildItem -LiteralPath "$env:USERPROFILE/.jdks" -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '17|21' -and (Test-Path -LiteralPath "$($_.FullName)/bin/javac.exe") } |
+            Sort-Object Name -Descending | Select-Object -First 1
+        if ($jdk) { $env:JAVA_HOME = $jdk.FullName }
+    }
+    if (-not $env:JAVA_HOME -or -not (Test-Path -LiteralPath "$env:JAVA_HOME/bin/javac.exe")) {
+        throw 'Set JAVA_HOME to a JDK 17 or 21 installation in .env.'
+    }
+    $java = Join-Path $env:JAVA_HOME 'bin/java.exe'
+    $maven = $env:MAVEN_CMD
+    if (-not $maven) {
+        $mavenCommand = Get-Command mvn.cmd -ErrorAction SilentlyContinue
+        if ($mavenCommand) { $maven = $mavenCommand.Source }
+    }
+    if (-not $maven) {
+        $maven = Get-ChildItem -LiteralPath "$env:USERPROFILE/.m2/wrapper/dists" -Filter mvn.cmd -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+    }
+    if (-not $maven) { throw 'Install Maven 3.6.3+ or set MAVEN_CMD to mvn.cmd in .env.' }
+    $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $npm) { throw 'Install Node.js 22 LTS (including npm) first.' }
 }
-if (-not $env:JAVA_HOME -or -not (Test-Path -LiteralPath "$env:JAVA_HOME/bin/javac.exe")) {
-    throw 'Set JAVA_HOME to a JDK 17 or 21 installation in .env.'
-}
-$java = Join-Path $env:JAVA_HOME 'bin/java.exe'
-$maven = $env:MAVEN_CMD
-if (-not $maven) {
-    $mavenCommand = Get-Command mvn.cmd -ErrorAction SilentlyContinue
-    if ($mavenCommand) { $maven = $mavenCommand.Source }
-}
-if (-not $maven) {
-    $maven = Get-ChildItem -LiteralPath "$env:USERPROFILE/.m2/wrapper/dists" -Filter mvn.cmd -Recurse -ErrorAction SilentlyContinue |
-        Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
-}
-if (-not $maven) { throw 'Install Maven 3.6.3+ or set MAVEN_CMD to mvn.cmd in .env.' }
-$npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
-if (-not $npm) { throw 'Install Node.js 22 LTS (including npm) first.' }
 
 $pgBin = $env:POSTGRES_BIN
 if (-not $pgBin) { $pgBin = Join-Path $PSScriptRoot '.tools/postgresql14/pgsql/bin' }
@@ -75,6 +77,9 @@ if ($pgVersion -notmatch '\b14\.10\b') { throw "Expected PostgreSQL 14.10. Found
 $pgPort = if ($env:POSTGRES_PORT) { $env:POSTGRES_PORT } else { '55432' }
 if ($pgPort -notmatch '^\d+$') { throw 'POSTGRES_PORT must be a port number.' }
 $pgData = Join-Path $PSScriptRoot 'data/pgdata'
+if ($DatabaseOnly -and -not (Test-Path -LiteralPath (Join-Path $pgData 'PG_VERSION'))) {
+    throw 'The existing database directory is missing. Recovery mode will not create an empty replacement database.'
+}
 $passwordFile = Join-Path $PSScriptRoot '.tools/pg-password.txt'
 # Reuse the password belonging to this isolated development database.
 $env:PGPASSWORD = if ((Test-Path -LiteralPath (Join-Path $pgData 'PG_VERSION')) -and (Test-Path -LiteralPath $passwordFile)) {
@@ -95,8 +100,13 @@ if ($LASTEXITCODE -ne 0) {
 $hasDb = & (Join-Path $pgBin 'psql.exe') -h 127.0.0.1 -p $pgPort -U minty -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='minty'"
 if ($LASTEXITCODE -ne 0) { throw 'Database connection failed. Check POSTGRES_PASSWORD in .env.' }
 if (([string]$hasDb).Trim() -ne '1') {
+    if ($DatabaseOnly) { throw 'The existing minty database was not found. Recovery mode will not create an empty replacement database.' }
     & (Join-Path $pgBin 'createdb.exe') -h 127.0.0.1 -p $pgPort -U minty minty
     if ($LASTEXITCODE -ne 0) { throw 'Could not create the minty database.' }
+}
+if ($DatabaseOnly) {
+    Write-Host "Existing development database is ready on 127.0.0.1:$pgPort. Frontend and backend were not restarted." -ForegroundColor Green
+    exit 0
 }
 $env:SPRING_DATASOURCE_URL = "jdbc:postgresql://127.0.0.1:$pgPort/minty"
 $env:SPRING_DATASOURCE_USERNAME = 'minty'

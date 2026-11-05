@@ -97,6 +97,11 @@ export function buildWorkflow(run, rawEvents = []) {
       node.output = data.output ?? event.content ?? ''
       node.status = data.status === 'failed' || data.isError === true || /^Error:/i.test(String(data.output || '')) ? 'failed' : 'completed'
       node.endedAt = event.createdAt; node.eventIds.push(event.id)
+    } else if (['hook', 'verification', 'completion_check'].includes(event.type)) {
+      nodes.push({ id: `${event.type}-${event.id}`, kind: event.type, name: data.hook || event.type,
+        title: event.type === 'hook' ? `生命周期 · ${{input:'输入',before_tool:'工具前',after_tool:'工具后',stop:'结束'}[data.hook] || data.hook}` : event.type === 'verification' ? '独立验证结果' : '验证后继续修复',
+        summary: data.reason || '', status: event.type === 'verification' && data.outcome === 'validation_failed' ? 'failed' : 'completed',
+        startedAt: event.createdAt, endedAt: event.createdAt, input: '', output: formatDetail(data), details: data, eventIds: [event.id] })
     } else if (event.type === 'error') {
       fatalError = String(event.content || '任务执行失败')
     }
@@ -110,7 +115,7 @@ export function buildWorkflow(run, rawEvents = []) {
       node.endedAt = run.finishedAt || events.at(-1)?.createdAt || null
       if (!node.output) node.output = run.error || fatalError || '运行结束前未收到此步骤的完成事件。'
     }
-    nodes.push({ id: 'result', kind: 'result', title: run.status === 'completed' ? '任务完成' : ['stopped', 'cancelled'].includes(run.status) ? '任务已停止' : '任务执行失败', summary: run.error || fatalError || (run.status === 'completed' ? '本次执行已结束' : '运行已停止，已完成的步骤仍保留'), status: run.status, startedAt: run.finishedAt || null, endedAt: run.finishedAt || null, input: '', output: run.error || fatalError || '', eventIds: [] })
+    nodes.push({ id: 'result', kind: 'result', title: run.status === 'completed' ? '本次执行结束' : ['stopped', 'cancelled'].includes(run.status) ? '任务已停止' : '任务执行失败', summary: run.error || fatalError || (run.status === 'completed' ? '本次执行已结束' : '运行已停止，已完成的步骤仍保留'), status: run.status, startedAt: run.finishedAt || null, endedAt: run.finishedAt || null, input: '', output: run.error || fatalError || '', eventIds: [] })
   } else if (nodes.length === 1) {
     nodes.push({ id: 'waiting', kind: 'waiting', title: '等待执行事件', summary: '任务已受理，等待执行进度', status: 'running', startedAt: run.createdAt, input: '', output: '', eventIds: [] })
   }

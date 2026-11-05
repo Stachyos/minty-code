@@ -1,10 +1,10 @@
 <script setup>
 import { computed, ref } from 'vue'
-import { chapterModules, moduleStatus } from '../chapterModules.js'
+import { chapterModules, moduleStatus, integrationLabel } from '../chapterModules.js'
 import { formatDetail, stateLabel } from '../workflow.js'
-const props=defineProps({stages:Array,edges:Array,currentStageId:String,selectedStageId:String,runStatus:String,rounds:Number,active:Boolean,disconnected:Boolean,follow:Boolean})
+const props=defineProps({stages:Array,edges:Array,nodes:Array,currentStageId:String,selectedStageId:String,runStatus:String,rounds:Number,active:Boolean,disconnected:Boolean,follow:Boolean})
 const emit=defineEmits(['select-stage'])
-const modules=computed(()=>chapterModules(props.stages,props.runStatus))
+const modules=computed(()=>chapterModules(props.stages,props.runStatus,props.nodes))
 const selected=ref(null)
 const open=ref(false)
 const detail=computed(()=>selected.value?.type==='module' ? modules.value.find(m=>m.id===selected.value.id) : props.stages.find(s=>s.id===selected.value?.id))
@@ -27,12 +27,12 @@ const current=computed(()=>props.stages.find(s=>s.id===props.currentStageId))
    </g>
   </svg>
   <div class="modules">
-   <div class="modules-heading"><span>教程部件 · S01—S17</span><span>点击查看状态与记录</span></div>
-   <div class="module-grid"><button v-for="m in modules" :key="m.id" class="module" :class="m.status" @click="select(m.id,'module')"><span class="module-name"><small>{{m.id.toUpperCase()}}</small><b>{{m.title}}</b></span><em>{{moduleStatus(m.status)}}</em></button></div>
+   <div class="modules-heading"><span>功能部件 · S01—S17</span><span>接入状态 / 本次执行 · 点击查看证据</span></div>
+   <div class="module-grid"><button v-for="m in modules" :key="m.id" class="module" :class="[m.status,m.integration]" @click="select(m.id,'module')"><span class="module-name"><small>{{m.id.toUpperCase()}}</small><b>{{m.title}}</b></span><em>{{integrationLabel(m.integration)}}<template v-if="m.integration !== 'unavailable'"> · {{moduleStatus(m.status)}}</template></em></button></div>
   </div>
  </div>
  <el-drawer v-model="open" :title="detail?.title || '执行详情'" size="min(480px, 94vw)" append-to-body>
-  <div v-if="detail" class="module-detail"><p class="detail-status">{{moduleStatus(detail.status)}}</p><p>{{detail.description}}</p><p v-if="!detail.entries.length">{{detail.status==='unavailable' ? '当前网页版尚未接入此部件，没有运行状态或执行记录。' : detail.status==='partial' ? '当前仅接入描述中的部分能力，没有独立部件事件。' : '本次任务尚无此部件的执行记录。'}}</p>
+  <div v-if="detail" class="module-detail"><p class="detail-status"><template v-if="detail.integration">{{integrationLabel(detail.integration)}} · </template>{{moduleStatus(detail.status)}}</p><p>{{detail.description}}</p><p v-if="!detail.entries.length">{{detail.integration==='unavailable' ? '当前尚未接入此部件，没有执行记录。' : detail.integration==='partial' ? '仅接入描述中的部分能力，本次没有匹配的执行记录。' : '本次任务没有触发此功能；不代表功能未接入。'}}</p>
    <section v-for="entry in [...detail.entries].reverse()" :key="entry.id"><h3>{{entry.title}} <small>{{stateLabel(entry.status)}}</small></h3><p v-if="entry.startedAt">{{new Date(entry.startedAt).toLocaleString()}}</p><h4 v-if="formatDetail(entry.input)">输入</h4><pre v-if="formatDetail(entry.input)">{{formatDetail(entry.input)}}</pre><h4 v-if="formatDetail(entry.output)">输出</h4><pre v-if="formatDetail(entry.output)">{{formatDetail(entry.output)}}</pre></section>
   </div>
  </el-drawer>
@@ -61,7 +61,7 @@ const current=computed(()=>props.stages.find(s=>s.id===props.currentStageId))
 .module-name{display:flex;align-items:baseline;gap:4px;min-width:0;font-size:11.5px}
 .module-name b{min-width:0;font-weight:400;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .module small{flex-shrink:0;font-size:9.5px;color:var(--faint)}
-.module em{flex-shrink:0;font-size:9.5px;font-style:normal;color:var(--faint);line-height:1.2}
+.module em{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0;font-size:9.5px;font-style:normal;color:var(--faint);line-height:1.2}
 .module.running{border-color:var(--mint-line);background:var(--mint-soft)}
 .module.running em{color:var(--mint-deep)}
 .module.failed em{color:var(--danger)}

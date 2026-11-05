@@ -24,8 +24,11 @@ function phasePayload(node, eventById) {
 function stageIdFor(node, eventById) {
   if (node.kind === 'phase') {
     const phase = node.phase || node.details?.phase || phasePayload(node, eventById).phase || 'prepare'
-    return { prepare: 'context', compact: 'context', context: 'context', decision: 'decision', feedback: 'feedback' }[phase] || null
+    return { prepare: 'context', compact: 'context', context: 'context', decision: 'decision', feedback: 'feedback', verification:'output' }[phase] || null
   }
+  if (node.kind === 'hook') return node.name === 'input' ? 'input' : node.name === 'stop' ? 'output' : 'tools'
+  if (node.kind === 'verification') return 'output'
+  if (node.kind === 'completion_check') return 'context'
   return { request: 'input', model: 'model', tool: 'tools', reply: 'output', result: 'output' }[node.kind] || null
 }
 

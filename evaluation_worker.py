@@ -15,6 +15,7 @@ import urllib.request
 
 import worker
 from agent_context import estimate_tokens, microcompact
+from coding_tools import TOOL_SCHEMAS, assess
 
 ROOT = Path(__file__).resolve().parent
 DATASET = 'princeton-nlp/SWE-bench_Lite'
@@ -159,6 +160,36 @@ elif op=='edit':
     return docker_exec(container, f'python -c {shlex.quote(code)} {shlex.quote(payload)}')
 
 
+class ContainerCodingTools:
+    """Same file/patch/verification policies, executed in the existing SWE container."""
+    def __init__(self, container, base):
+        self.container = container; self.base = base; self.last_test = None
+
+    def invoke(self, operation, **arguments):
+        payload = json.dumps({'operation': operation, 'arguments': arguments, 'base': self.base})
+        process = subprocess.run(['docker', 'exec', '-i', self.container, '/bin/bash', '-lc',
+            'source /opt/miniconda3/bin/activate testbed && python /opt/minty/coding_tools.py'],
+            input=payload, capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=int(arguments.get('timeout_seconds', 90)) + 45)
+        if process.returncode: raise RuntimeError((process.stderr or process.stdout)[-2000:])
+        result = json.loads(process.stdout)
+        if operation == 'run_tests':
+            if 'fingerprint' not in result:
+                result.update(status='unavailable', fingerprint=self.get_diff()['fingerprint'], counts={}, output=result.get('error','测试工具不可用'), exitCode=None)
+            self.last_test = result
+        return result
+
+    @property
+    def handlers(self):
+        return {tool['name']: (lambda _name=tool['name'], **kw: self.invoke(_name, **kw)) for tool in TOOL_SCHEMAS}
+
+    def get_diff(self): return self.invoke('get_diff')
+    def assessment(self): return assess(self.get_diff(), self.last_test)
+    def suggested_test(self):
+        # Benchmark tests may require repo-specific selection; the model selects a relevant target.
+        return None
+
+
 def solve(row, request, batch, index, run_dir):
     import anthropic
     name = container_name(batch, f'agent-{index}')
@@ -177,6 +208,9 @@ def solve(row, request, batch, index, run_dir):
         setup = docker_exec(name, f"git config --global --add safe.directory /testbed && git checkout --detach {row['base_commit']}")
         if setup.startswith('Error:'):
             raise RuntimeError(setup)
+        command(['docker', 'exec', name, 'mkdir', '-p', '/opt/minty'])
+        command(['docker', 'cp', str(ROOT / 'coding_tools.py'), f'{name}:/opt/minty/coding_tools.py'])
+        coding = ContainerCodingTools(name, row['base_commit'])
         schemas = [
             {'name': 'bash', 'description': 'Run a Linux shell command in /testbed. Use ls, grep, find, git diff and tests to inspect and fix the repository. No network.',
              'input_schema': {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']}},
@@ -210,6 +244,9 @@ def solve(row, request, batch, index, run_dir):
                   + row['problem_statement'])
         old_emit = worker.emit
         def bridge(kind, content='', **extra):
+            if kind == 'verification':
+                task_dir = run_dir / row['instance_id']; task_dir.mkdir(exist_ok=True)
+                (task_dir / 'verification.json').write_text(content, encoding='utf-8')
             emit('agent', instanceId=row['instance_id'], eventType=kind, content=content, **extra)
         worker.emit = bridge
         old_shell = os.environ.get('AGENT_ALLOW_SHELL')
@@ -225,7 +262,7 @@ def solve(row, request, batch, index, run_dir):
         infrastructure_error = False
         try:
             worker.execute({'prompt': prompt, 'maxSteps': request['maxSteps'], 'model': request['model']}, core, workspace,
-                           shell_handler=lambda command: docker_exec(name, command),
+                           shell_handler=lambda command: docker_exec(name, command), coding=coding,
                            system_override='You are Minty, a coding agent. Fix the supplied issue in /testbed. '
                            'All tools execute inside an isolated Linux repository environment. Use relative file paths. '
                            'Inspect code, make the smallest correct fix, run relevant tests, and leave a patch. '
@@ -304,7 +341,7 @@ def evaluate(request, data_root, run_dir):
     manifest = {'dataset': DATASET, 'split': 'test', 'harnessVersion': VERSION,
                 'datasetSha256': hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest(),
                 'workerSha256': hashlib.sha256(Path(__file__).read_bytes() + (ROOT / 'worker.py').read_bytes()
-                                              + (ROOT / 'agent_context.py').read_bytes()).hexdigest(),
+                                              + (ROOT / 'agent_context.py').read_bytes() + (ROOT / 'coding_tools.py').read_bytes()).hexdigest(),
                 'harnessImageDigest': harness_digest,
                 'config': request, 'instanceIds': [row['instance_id'] for row in selected]}
     (run_dir / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')

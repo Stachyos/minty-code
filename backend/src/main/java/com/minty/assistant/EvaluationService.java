@@ -90,6 +90,16 @@ public class EvaluationService {
     }
 
     public Object catalog() throws IOException, InterruptedException { return query("--catalog", 150); }
+    public List<Map<String, Object>> suites() throws IOException {
+        Path directory = script.resolveSibling("benchmarks");
+        if (!Files.isDirectory(directory)) return List.of();
+        List<Map<String, Object>> result = new ArrayList<>();
+        try (var paths = Files.list(directory)) {
+            for (Path path : paths.filter(p -> p.getFileName().toString().matches("[a-zA-Z0-9-]+\\.json")).sorted().toList())
+                result.add(json.readValue(path.toFile(), new TypeReference<>() {}));
+        }
+        return result;
+    }
 
     public synchronized List<Map<String, Object>> list() {
         return records.values().stream().sorted(Comparator.comparing(r -> r.get("createdAt").toString(), Comparator.reverseOrder()))
@@ -126,6 +136,12 @@ public class EvaluationService {
         request.put("action", setup ? "setup" : "evaluate"); request.put("model", config.model());
         if (!setup) {
             request.put("limit", input.limit()); request.put("instanceIds", input.instanceIds() == null ? List.of() : input.instanceIds());
+            if (input.suiteId() != null && !input.suiteId().isBlank()) {
+                var suite = suites().stream().filter(item -> item.get("id").equals(input.suiteId())).findFirst()
+                        .orElseThrow(() -> new ApiException(HttpStatus.BAD_REQUEST, "固定题集不存在"));
+                request.put("instanceIds", suite.get("instanceIds")); request.put("suiteId", suite.get("id"));
+                request.put("suiteManifest", suite);
+            }
             request.put("maxSteps", input.maxSteps()); request.put("timeoutSeconds", input.timeoutSeconds());
             request.put("testTimeoutSeconds", input.testTimeoutSeconds());
         }
@@ -251,7 +267,7 @@ public class EvaluationService {
     public synchronized String artifact(String id, String instance, String kind) throws IOException {
         var record = require(id);
         if (tasks(record).stream().noneMatch(task -> task.get("instanceId").equals(instance))) throw new ApiException(HttpStatus.NOT_FOUND, "题目不存在");
-        String file = Map.of("patch", "patch.diff", "report", "report.json", "tests", "test_output.txt").get(kind);
+        String file = Map.of("patch", "patch.diff", "report", "report.json", "tests", "test_output.txt", "verification", "verification.json").get(kind);
         if (file == null) throw new ApiException(HttpStatus.BAD_REQUEST, "不支持的文件类型");
         Path path = root.resolve(id).resolve(instance).resolve(file).normalize();
         if (!path.startsWith(root.resolve(id)) || !Files.isRegularFile(path)) throw new ApiException(HttpStatus.NOT_FOUND, "文件尚未生成");

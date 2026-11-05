@@ -235,7 +235,7 @@ onBeforeUnmount(() => {
           <el-checkbox v-model="followStep" @change="followCurrent">跟随当前阶段</el-checkbox>
         </div>
         <div v-if="isLegacy" class="legacy-note">此历史记录只保存了部分阶段；图中仅点亮有执行记录的节点。</div>
-        <WorkflowRing :stages="loop.stages" :edges="loop.edges" :current-stage-id="loop.currentStageId" :selected-stage-id="selectedStageId" :run-status="run?.status" :rounds="loop.rounds" :active="active" :disconnected="Boolean(pollError || listError)" :follow="followStep" @select-stage="selectStage" />
+        <WorkflowRing :stages="loop.stages" :edges="loop.edges" :nodes="flow.nodes" :current-stage-id="loop.currentStageId" :selected-stage-id="selectedStageId" :run-status="run?.status" :rounds="loop.rounds" :active="active" :disconnected="Boolean(pollError || listError)" :follow="followStep" @select-stage="selectStage" />
       </section>
 
       <aside class="flow-details" aria-label="执行步骤详情">

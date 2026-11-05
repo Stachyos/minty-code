@@ -57,4 +57,12 @@ class EvaluationServiceTest {
             assertThatThrownBy(() -> service.artifact(id, "psf__requests-2317", "../../run.json")).isInstanceOf(ApiException.class);
         } finally { service.shutdown(); }
     }
+    @Test void fixedSuiteManifestsAreLoadedWithoutExposingOtherFiles() throws Exception {
+        Files.createDirectories(root.resolve("benchmarks"));
+        json.writeValue(root.resolve("benchmarks/stage1.json").toFile(), Map.of("id","stage1","instanceIds",List.of("psf__requests-2317")));
+        Files.writeString(root.resolve("benchmarks/private.txt"),"not a suite");
+        EvaluationService service=service();
+        try { assertThat(service.suites()).hasSize(1); assertThat(service.suites().get(0).get("id")).isEqualTo("stage1"); }
+        finally { service.shutdown(); }
+    }
 }

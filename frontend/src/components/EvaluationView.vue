@@ -4,13 +4,15 @@ import { ElMessage } from 'element-plus'
 import Icon from './Icon.vue'
 import { api, errorMessage } from '../api'
 import './EvaluationView.css'
+import { compareEvaluations } from '../evaluationComparison'
 
 const environment = ref(null), history = ref([]), current = ref(null), catalog = ref([])
 const events = ref([]), error = ref(''), busy = ref(false), catalogLoading = ref(false)
 const selectedTask = ref(''), tab = ref('trace'), artifact = ref(''), artifactLoading = ref(false)
 const query = ref(''), chosen = ref([]), showNew = ref(false)
+const suites = ref([]), baselineId = ref(''), baseline = ref(null)
 const traceElement = ref(null), follow = ref(true)
-const form = ref({ name: 'SWE-Lite · 基线实验', limit: 1, maxSteps: 24, timeoutSeconds: 1200, testTimeoutSeconds: 900 })
+const form = ref({ name: 'SWE-Lite · 基线实验', limit: 1, maxSteps: 24, timeoutSeconds: 1200, testTimeoutSeconds: 900, suiteId: '' })
 let timer, dead = false, version = 0, artifactVersion = 0
 const activeStates = ['running', 'preparing', 'stopping']
 const running = computed(() => activeStates.includes(current.value?.status))
@@ -44,6 +46,17 @@ const date = value => value ? new Date(value).toLocaleString('zh-CN', { month: '
 const duration = value => value == null ? '—' : value < 60 ? `${Math.round(value)} 秒` : `${Math.floor(value / 60)} 分 ${Math.round(value % 60)} 秒`
 const elapsed = computed(() => current.value?.createdAt && current.value?.finishedAt ? duration((new Date(current.value.finishedAt) - new Date(current.value.createdAt)) / 1000) : running.value ? '进行中' : '—')
 const comparison = computed(() => history.value.filter(run => run.action === 'evaluate' && run.total > 0).slice(0, 8))
+const paired = computed(() => compareEvaluations(baseline.value, current.value))
+async function loadBaseline() {
+  const id = baselineId.value
+  if (!id) { baseline.value = null; return }
+  try { const response = await api.get(`/evaluations/${id}`); if (id === baselineId.value) baseline.value = response.data }
+  catch (e) { error.value = errorMessage(e) }
+}
+function applySuite() {
+  const suite = suites.value.find(item => item.id === form.value.suiteId)
+  chosen.value = suite ? [...suite.instanceIds] : []
+}
 function eventTitle(event) {
   if (event.eventType === 'phase' || event.eventType === 'tool_start' || event.eventType === 'tool_result') {
     try {
@@ -138,6 +151,7 @@ async function openNew() {
   finally { catalogLoading.value = false }
 }
 function toggleChosen(id) {
+  form.value.suiteId = ''
   chosen.value = chosen.value.includes(id) ? chosen.value.filter(value => value !== id) : [...chosen.value, id]
 }
 async function showArtifact(kind) {
@@ -155,7 +169,8 @@ function downloadReport() {
   const link = document.createElement('a'); link.href = url; link.download = `swe-lite-${current.value.id}.json`; link.click(); URL.revokeObjectURL(url)
 }
 onMounted(async () => {
-  await refreshEnvironment()
+  refreshEnvironment()
+  api.get('/evaluations/suites').then(response => { if (!dead) suites.value = response.data }).catch(e => { if (!dead) error.value = errorMessage(e) })
   try { await refreshHistory(); if (!dead && history.value.length) await selectRun(history.value.find(run => activeStates.includes(run.status))?.id || history.value.find(run => run.action === 'evaluate' && run.total > 0)?.id || history.value[0].id) }
   catch (e) { error.value = errorMessage(e) }
 })
@@ -209,10 +224,11 @@ onBeforeUnmount(() => { dead = true; version++; clearTimeout(timer) })
     </div>
 
     <section v-if="comparison.length" class="eval-comparison eval-panel"><div class="eval-panel-title"><h2>实验结果对照</h2><span>仅相同题目、模型和预算下可直接比较</span></div><table><thead><tr><th>实验</th><th>题目</th><th>通过率</th><th>Token</th><th>环境错误</th></tr></thead><tbody><tr v-for="item in comparison" :key="item.id" @click="selectRun(item.id)"><td>{{ item.name }}<small>{{ item.model }}</small></td><td>{{ item.total }}</td><td>{{ (item.resolved / item.total * 100).toFixed(1) }}%</td><td>{{ count(item.inputTokens + item.outputTokens) }}</td><td>{{ item.errors }}</td></tr></tbody></table></section>
+    <section v-if="current?.action === 'evaluate'" class="eval-comparison eval-panel"><div class="eval-panel-title"><h2>与基线逐题对比</h2><el-select v-model="baselineId" placeholder="选择已结束的基线实验" style="width:260px" clearable @change="loadBaseline"><el-option v-for="item in history.filter(item => item.action === 'evaluate' && item.status === 'completed' && item.total > 0 && item.id !== current.id)" :key="item.id" :value="item.id" :label="item.name" /></el-select></div><template v-if="baseline"><div class="eval-paired-summary">{{ paired.comparable ? '题目、模型与预算一致，可比较' : `仅供查看，无法直接比较：${paired.reasons.join('、')}` }} · 改善 {{ paired.improved }} · 回退 {{ paired.regressed }} · 环境异常 {{ paired.infrastructure }} · Token 变化 {{ count(paired.tokenDelta) }}</div><table><thead><tr><th>题目</th><th>基线</th><th>当前</th><th>变化</th></tr></thead><tbody><tr v-for="row in paired.rows" :key="row.id"><td>{{ row.id }}</td><td>{{ label(row.before) }}</td><td>{{ label(row.after) }}</td><td>{{ ({improved:'改善',regressed:'回退',unchanged:'不变',infrastructure:'环境错误，单列',missing:'题目不匹配'})[row.change] }}</td></tr></tbody></table></template><p v-else class="eval-empty">运行相同题集的不同版本后，在这里选择基线，检查哪些题改善、哪些题回退。</p></section>
     <footer class="eval-footnote"><Icon name="shield" :size="13" />通过率按本次选定题数计算，环境错误与未完成题也保留在分母中。Token 来自模型响应；未配置价格时不估算费用。</footer>
 
     <el-dialog v-model="showNew" title="新建真实模型评测" width="min(720px, 94vw)" class="eval-dialog">
-      <div class="eval-form"><label>实验名称<input v-model="form.name" maxlength="100" /></label><div class="eval-form-grid"><label>默认题数<input v-model.number="form.limit" type="number" min="1" max="300" /></label><label>每题最大轮数<input v-model.number="form.maxSteps" type="number" min="1" max="40" /></label><label>做题时限（秒）<input v-model.number="form.timeoutSeconds" type="number" min="60" max="7200" /></label><label>测试时限（秒）<input v-model.number="form.testTimeoutSeconds" type="number" min="60" max="7200" /></label></div><div class="eval-picker-title"><strong>指定题目（可选）</strong><button @click="chosen = []">清空选择 {{ chosen.length ? `(${chosen.length})` : '' }}</button></div><input v-model="query" placeholder="搜索题目 ID、仓库或问题内容" aria-label="搜索题目" /><p>不指定时使用题库顺序的前 {{ form.limit }} 题；指定后按选择列表运行。</p><div class="eval-picker"><div v-if="catalogLoading" class="eval-empty">正在加载官方题库…</div><button v-for="item in filteredCatalog" :key="item.instanceId" :class="{ selected: chosen.includes(item.instanceId) }" @click="toggleChosen(item.instanceId)"><Icon :name="chosen.includes(item.instanceId) ? 'check' : 'circle'" :size="15" /><span>{{ item.instanceId }}</span><small>{{ item.repo }}</small></button></div><p>使用服务端配置的 {{ environment?.model }} 真实调用模型；首次运行某题需下载对应环境。</p></div>
+      <div class="eval-form"><label>实验名称<input v-model="form.name" maxlength="100" /></label><label style="margin-top:14px">固定回归题集<select v-model="form.suiteId" @change="applySuite"><option value="">手动选题 / 默认题数</option><option v-for="suite in suites" :key="suite.id" :value="suite.id">{{ suite.name }}</option></select></label><div class="eval-form-grid"><label>默认题数<input v-model.number="form.limit" type="number" min="1" max="300" /></label><label>每题最大轮数<input v-model.number="form.maxSteps" type="number" min="1" max="40" /></label><label>做题时限（秒）<input v-model.number="form.timeoutSeconds" type="number" min="60" max="7200" /></label><label>测试时限（秒）<input v-model.number="form.testTimeoutSeconds" type="number" min="60" max="7200" /></label></div><div class="eval-picker-title"><strong>指定题目（可选）</strong><button @click="chosen = []; form.suiteId = ''">清空选择 {{ chosen.length ? `(${chosen.length})` : '' }}</button></div><input v-model="query" placeholder="搜索题目 ID、仓库或问题内容" aria-label="搜索题目" /><p>不指定时使用题库顺序的前 {{ form.limit }} 题；固定题集会保存选题清单和版本，便于后续复测。</p><div class="eval-picker"><div v-if="catalogLoading" class="eval-empty">正在加载官方题库…</div><button v-for="item in filteredCatalog" :key="item.instanceId" :class="{ selected: chosen.includes(item.instanceId) }" @click="toggleChosen(item.instanceId)"><Icon :name="chosen.includes(item.instanceId) ? 'check' : 'circle'" :size="15" /><span>{{ item.instanceId }}</span><small>{{ item.repo }}</small></button></div><p>使用服务端配置的 {{ environment?.model }} 真实调用模型；首次运行某题需下载对应环境。</p></div>
       <template #footer><el-button @click="showNew = false">取消</el-button><el-button type="primary" :loading="busy" :disabled="!form.name.trim() || anyActive" @click="start(false)">开始评测 · {{ chosen.length || form.limit }} 题</el-button></template>
     </el-dialog>
   </section>

@@ -1,0 +1,8 @@
+{
+  "id": "swe-lite-stage1-v1",
+  "name": "第一阶段固定题集 v1 · 10 题",
+  "dataset": "princeton-nlp/SWE-bench_Lite",
+  "split": "test",
+  "description": "用于内部回归实验，固定覆盖 Flask、Requests、Pytest、Django、SymPy；不是完整榜单分数，也不代表随机抽样结果。",
+  "instanceIds": ["pallets__flask-4045", "pallets__flask-4992", "psf__requests-1963", "psf__requests-2148", "pytest-dev__pytest-11143", "pytest-dev__pytest-11148", "django__django-10914", "django__django-10924", "sympy__sympy-11400", "sympy__sympy-11870"]
+}
