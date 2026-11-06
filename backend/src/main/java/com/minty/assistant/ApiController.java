@@ -28,6 +28,8 @@ public class ApiController {
     @GetMapping("/runs") public List<AgentRun> runs(@RequestParam(required = false) String sessionId) { return agent.recentRuns(sessionId); }
     @GetMapping("/runs/{id}") public AgentRun run(@PathVariable String id) { return agent.requireRun(id); }
     @PostMapping("/runs/{id}/stop") public AgentRun stop(@PathVariable String id) { return agent.stop(id); }
+    @PostMapping("/runs/{id}/pause") public AgentRun pause(@PathVariable String id) { return agent.pause(id); }
+    @PostMapping("/runs/{id}/resume") public AgentRun resume(@PathVariable String id) throws IOException { return agent.resume(id); }
     @GetMapping("/runs/{id}/events") public List<RunEvent> events(@PathVariable String id, @RequestParam(defaultValue = "0") long after) {
         return agent.events(id, after);
     }

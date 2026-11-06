@@ -30,6 +30,20 @@ public class WorkspaceService {
         }
         return path.toRealPath();
     }
+    Path checkpoint(String runId) throws IOException {
+        UUID.fromString(runId);
+        Path directory = root.resolve(".minty-run-state");
+        Files.createDirectories(directory);
+        if (!directory.toRealPath().equals(root.toRealPath().resolve(".minty-run-state"))) {
+            throw new IOException("任务检查点目录不可用");
+        }
+        Path checkpoint = directory.resolve(runId);
+        if (Files.exists(checkpoint, LinkOption.NOFOLLOW_LINKS)
+                && !checkpoint.toRealPath().equals(directory.toRealPath().resolve(runId))) {
+            throw new IOException("任务检查点目录不可用");
+        }
+        return checkpoint;
+    }
     public List<Map<String, Object>> files(String sessionId) throws IOException {
         Path workspace = workspace(sessionId);
         try (Stream<Path> paths = Files.walk(workspace, 12)) {

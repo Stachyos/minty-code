@@ -57,7 +57,7 @@ def digest(data):
 
 class LifecycleHooks:
     """Explicit extension points; hook errors stop the affected operation."""
-    NAMES = {'input', 'before_tool', 'after_tool', 'stop'}
+    NAMES = {'input', 'before_tool', 'after_tool', 'stop', 'resume'}
 
     def __init__(self):
         self.callbacks = {name: [] for name in self.NAMES}
@@ -73,12 +73,13 @@ class LifecycleHooks:
 
 
 class CodingTools:
-    def __init__(self, workspace, run_id=None, notify=None, capture_baseline=True):
+    def __init__(self, workspace, run_id=None, notify=None, capture_baseline=True, scratch_root=None):
         self.root = Path(workspace).resolve()
         self.run_id = run_id or str(uuid.uuid4())
         if not re.fullmatch(r'[a-zA-Z0-9-]{1,80}', self.run_id):
             raise ValueError('Invalid run id')
         self.notify = notify or (lambda *args, **kwargs: None)
+        self.scratch_root = scratch_root
         self.baseline = self.snapshot() if capture_baseline else {}
         self.last_test = None
         self.last_test_files = None
@@ -292,7 +293,7 @@ class CodingTools:
                 key = digest((image_id+self.fingerprint(manifests)+runner+prefix+'dependency-policy-v2').encode())[:24]
                 test_image = f'minty-coding-deps:{key}'
                 if subprocess.run(['docker','image','inspect',test_image],capture_output=True,timeout=15).returncode:
-                    with tempfile.TemporaryDirectory(prefix='minty-dependencies-') as preparation:
+                    with tempfile.TemporaryDirectory(prefix='minty-dependencies-', dir=self.scratch_root) as preparation:
                         for relative,data in manifests.items():
                             target=Path(preparation)/relative; target.parent.mkdir(parents=True,exist_ok=True); target.write_bytes(data)
                         # No source files, settings.xml, .npmrc, .env or credentials enter this build context.
@@ -319,7 +320,7 @@ class CodingTools:
                     command=['/bin/sh','-c',f'cp -a /opt/maven-repo /workspace/.maven-repo && mvn -B -o -f {pom} -Dmaven.repo.local=/workspace/.maven-repo -Dstyle.color=never test']
             identity = subprocess.run(['docker','image','inspect','--format','{{.Id}}',test_image],capture_output=True,text=True,timeout=15)
             result.update(testImage=test_image, imageDigest=identity.stdout.strip(), command=command)
-            with tempfile.TemporaryDirectory(prefix='minty-tests-') as folder:
+            with tempfile.TemporaryDirectory(prefix='minty-tests-', dir=self.scratch_root) as folder:
                 for relative, data in files.items():
                     target = Path(folder) / relative; target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(data)
                 try:

@@ -14,6 +14,7 @@ interface RunRepository extends JpaRepository<AgentRun, String> {
     List<AgentRun> findTop50BySessionIdOrderByCreatedAtDesc(String sessionId);
     Optional<AgentRun> findFirstBySessionIdOrderByCreatedAtDesc(String sessionId);
     List<AgentRun> findByStatus(String status);
+    List<AgentRun> findByCleanupPendingTrue();
     List<AgentRun> findAllByOrderByCreatedAtAsc();
 }
 interface EventRepository extends JpaRepository<RunEvent, Long> {

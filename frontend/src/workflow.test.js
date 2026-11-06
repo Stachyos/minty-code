@@ -39,6 +39,25 @@ test('tool errors remain failed even if the overall run succeeds', () => {
   assert.equal(graph.nodes.at(-1).status, 'completed')
 })
 
+test('resumed workflow keeps the interrupted attempt separate and skips a prior edit', () => {
+  const graph = buildWorkflow(run('running'), [
+    event(1, 'model_start', { round: 2 }),
+    event(2, 'background', { jobId: 'old', status: 'running' }),
+    event(3, 'status', 'interrupted'),
+    event(4, 'status', 'running'),
+    event(5, 'recovery', { changedCount: 1, changedPaths: ['a.txt'] }),
+    event(6, 'tool_start', { name: 'write_file', toolUseId: 'duplicate' }),
+    event(7, 'tool_result', { name: 'write_file', toolUseId: 'duplicate', status: 'skipped' }),
+    event(8, 'model_start', { round: 4 })
+  ])
+  assert.equal(graph.nodes.find(node => node.round === 2).status, 'interrupted')
+  assert.equal(graph.nodes.find(node => node.kind === 'background').status, 'interrupted')
+  assert.equal(graph.nodes.find(node => node.kind === 'recovery').status, 'completed')
+  assert.equal(graph.nodes.find(node => node.toolUseId === 'duplicate').status, 'skipped')
+  assert.equal(graph.completedTools, 0)
+  assert.equal(graph.nodes.find(node => node.id === graph.activeNodeId).round, 4)
+})
+
 test('stopped and failed runs never mark an unfinished step completed', () => {
   for (const status of ['stopped', 'failed', 'completed']) {
     const graph = buildWorkflow(run(status), [event(1, 'model_start', { round: 1 })])

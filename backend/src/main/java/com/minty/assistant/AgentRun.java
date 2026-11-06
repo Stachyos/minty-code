@@ -17,6 +17,15 @@ public class AgentRun {
     public long outputTokens;
     @Column(columnDefinition = "text") public String verification;
     @Column(columnDefinition = "text") public String changes;
+    @Column(columnDefinition = "text") public String progress;
+    public Integer maxRounds;
+    public Integer roundsUsed;
+    public Integer maxTokens;
+    public Integer timeLimitSeconds;
+    public Long elapsedMillis;
+    public Instant attemptStartedAt;
+    public Boolean resumable;
+    public Boolean cleanupPending;
     @Column(nullable = false) public Instant createdAt;
     public Instant finishedAt;
     protected AgentRun() {}

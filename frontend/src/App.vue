@@ -7,6 +7,7 @@ import Icon from './components/Icon.vue'
 import WorkflowView from './components/WorkflowView.vue'
 import EvaluationView from './components/EvaluationView.vue'
 import RunOutcome from './components/RunOutcome.vue'
+import TaskProgress from './components/TaskProgress.vue'
 import { api, errorMessage } from './api'
 
 const mascotUrl = '/images/minty-catgirl.png'
@@ -56,7 +57,10 @@ let destroyed = false
 const activeSession = computed(() => sessions.value.find(s => s.id === selectedId.value))
 const viewTitle = computed(() => ({ workspace: '编程工作台', workflow: '工作流程', analytics: '使用概览', evaluation: 'Agent 评测' })[view.value])
 const active = computed(() => ['queued', 'running', 'pending', 'stopping'].includes(String(run.value?.status).toLowerCase()))
-const liveText = computed(() => events.value.filter(e => ['text', 'assistant_delta', 'text_delta'].includes(e.type)).map(e => e.content).join(''))
+const liveText = computed(() => {
+  const start = events.value.findLastIndex(event => event.type === 'status' && event.content === 'running')
+  return events.value.slice(start + 1).filter(event => ['text', 'assistant_delta', 'text_delta'].includes(event.type)).map(event => event.content).join('')
+})
 const toolEvents = computed(() => events.value.filter(e => !['text', 'assistant_delta', 'text_delta'].includes(e.type)))
 const completedTasks = computed(() => tasks.value.filter(t => ['completed', 'done'].includes(String(t.status).toLowerCase())).length)
 const taskProgress = computed(() => tasks.value.length ? Math.round(completedTasks.value / tasks.value.length * 100) : 0)
@@ -68,12 +72,12 @@ const normalizeState = value => String(value || '').toLowerCase()
 const formatCount = n => Number(n || 0).toLocaleString('zh-CN')
 const formatTime = date => date ? new Date(date).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : ''
 const sessionDate = date => date ? new Date(date).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' }) : ''
-const stateLabel = value => ({ queued: '排队中', pending: '等待中', running: '进行中', stopping: '正在停止', completed: '执行已结束', succeeded: '执行已结束', failed: '出错了', cancelled: '已停止', stopped: '已停止', in_progress: '进行中' })[normalizeState(value)] || value || '等待中'
+const stateLabel = value => ({ queued: '排队中', pending: '等待中', running: '进行中', stopping: '正在停止', completed: '执行已结束', succeeded: '执行已结束', failed: '出错了', cancelled: '已停止', stopped: '已停止', interrupted: '已中断', budget_exhausted: '预算已耗尽', in_progress: '进行中' })[normalizeState(value)] || value || '等待中'
 const bytes = size => size < 1024 ? `${size} B` : size < 1048576 ? `${(size / 1024).toFixed(1)} KB` : `${(size / 1048576).toFixed(1)} MB`
 function eventDetails(event) {
   try { return JSON.stringify(JSON.parse(event.content), null, 2) } catch { return event.content }
 }
-const TOOL_LABELS = { list_files:'查找文件', search_text:'搜索代码', apply_patch:'应用补丁', get_diff:'检查修改', run_tests:'运行测试', read_file: '读取文件', write_file: '创建文件', edit_file: '修改文件', bash: '执行命令', TodoWrite: '更新待办', task_create: '创建任务', task_get: '查看任务', task_update: '更新任务', task_list: '读取任务列表', load_skill: '加载技能', compress: '压缩上下文' }
+const TOOL_LABELS = { list_files:'查找文件', search_text:'搜索代码', apply_patch:'应用补丁', get_diff:'检查修改', run_tests:'运行测试', read_file: '读取文件', write_file: '创建文件', edit_file: '修改文件', bash: '执行命令', TodoWrite: '更新待办', task_create: '创建任务', task_get: '查看任务', task_update: '更新任务', task_list: '读取任务列表', load_skill: '加载技能', compress: '压缩上下文', update_progress: '更新任务进度', review_step: '回查步骤记录', start_background: '启动后台命令', background_status: '查看后台命令', stop_background: '停止后台命令' }
 function eventTitle(event) {
   if (event.type === 'verification') return '独立验证结果'
   if (event.type === 'changes') return '文件修改记录'
@@ -81,6 +85,8 @@ function eventTitle(event) {
   if (event.type === 'completion_check') return '验证未通过，继续修复'
   if (event.type === 'error') return '执行遇到问题'
   if (event.type === 'status') return '运行状态更新'
+  if (event.type === 'recovery') return '核对恢复检查点'
+  if (event.type === 'background') return '后台命令状态'
   if (event.type === 'tool_result') return '工具返回结果'
   if (event.type === 'model_start') return '调用模型'
   if (event.type === 'model_end') return '模型返回'
@@ -238,22 +244,22 @@ async function send() {
   } catch (e) { loadError.value = errorMessage(e); ElMessage.error(loadError.value) }
   finally { sending.value = false }
 }
-async function stop() {
+async function runAction(action) {
   if (!run.value?.id || stopping.value) return
   const runId = run.value.id
   const version = selectionVersion
   stopping.value = true
   try {
-    const result = await api.post(`/runs/${runId}/stop`)
+    const result = await api.post(`/runs/${runId}/${action}`)
     if (version === selectionVersion && run.value?.id === runId) {
       run.value = result.data
       await pollRun(runId, version)
     }
-    ElMessage.info('任务已停止。')
   }
   catch (e) { ElMessage.error(errorMessage(e)) }
   finally { stopping.value = false }
 }
+const stop = () => runAction('stop')
 function onComposerKey(event) {
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); send() }
 }
@@ -384,6 +390,7 @@ onBeforeUnmount(() => { destroyed = true; clearTimeout(pollTimer); clearTimeout(
         <section class="conversation-area">
           <div class="conversation-header"><div><span class="mini-icon"><Icon name="chat" :size="15" /></span><strong>{{ activeSession?.title || '新对话' }}</strong><span v-if="selectedId" class="session-badge">已保存</span></div><div class="conversation-actions"><button v-if="run" class="workflow-link" @click="changeView('workflow')"><Icon name="workflow" :size="14" /><span>查看流程</span></button><button class="icon-button context-toggle" title="任务与文件" aria-label="打开任务与文件" @click="contextOpen = true"><Icon name="folder" :size="16" /></button><button class="icon-button" title="设置与连接" aria-label="设置与连接" @click="settingsOpen = true"><Icon name="settings" :size="16" /></button></div></div>
           <RunOutcome :run="run" :events="events" />
+          <TaskProgress :run="run" :events="events" :busy="stopping" @pause="runAction('pause')" @resume="runAction('resume')" />
           <div ref="chatScroller" class="chat-scroll">
             <div v-if="loadingSession" class="loading-state"><span class="loading-dot"></span>正在打开对话…</div>
             <div v-else-if="!messages.length && !active" class="welcome">
@@ -420,7 +427,7 @@ onBeforeUnmount(() => { destroyed = true; clearTimeout(pollTimer); clearTimeout(
       </div>
     </main>
 
-    <el-dialog v-model="settingsOpen" title="设置与连接" width="520px" class="mint-dialog" align-center><div class="settings-intro"><div><h3>连接状态</h3><p>模型密钥只保存在后端，不会发送到网页。</p></div></div><div class="settings-rows"><div><span>后端连接</span><strong :class="connected ? 'text-mint' : 'text-error'">{{ connected ? '连接正常' : '尚未连接' }}</strong></div><div><span>数据库连接</span><strong>{{ !connected ? '尚未检查' : status?.databaseReady === false ? '连接中断' : status?.databaseReady === true ? '连接正常' : '等待检查' }}</strong></div><div><span>模型配置</span><strong>{{ status?.configured ? '已配置' : '尚未配置' }}</strong></div><div><span>当前模型</span><code>{{ status?.model || '—' }}</code></div><div><span>命令执行</span><strong>{{ status?.shellEnabled ? '已启用' : '已关闭（仅文件工具）' }}</strong></div><div><span>服务状态</span><strong>{{ statusLabel }}</strong></div></div><div class="settings-guide"><strong>首次使用</strong><ol><li>按项目 README 配置 PostgreSQL 与后端环境变量。</li><li>设置 <code>ANTHROPIC_API_KEY</code>、<code>MODEL_ID</code>；需要时设置兼容服务的地址。</li><li>启动后端，再点击下方按钮检查连接。</li></ol><p>为了保护密钥，配置需要在本机后端完成。此页面不会展示或保存 API Key。</p></div><template #footer><el-button @click="settingsOpen = false">关闭</el-button><el-button type="primary" :loading="initialLoading" @click="initialize">重新检查连接</el-button></template></el-dialog>
+    <el-dialog v-model="settingsOpen" title="设置与连接" width="520px" class="mint-dialog" align-center><div class="settings-intro"><div><h3>连接状态</h3><p>模型密钥只保存在后端，不会发送到网页。</p></div></div><div class="settings-rows"><div><span>后端连接</span><strong :class="connected ? 'text-mint' : 'text-error'">{{ connected ? '连接正常' : '尚未连接' }}</strong></div><div><span>数据库连接</span><strong>{{ !connected ? '尚未检查' : status?.databaseReady === false ? '连接中断' : status?.databaseReady === true ? '连接正常' : '等待检查' }}</strong></div><div><span>模型配置</span><strong>{{ status?.configured ? '已配置' : '尚未配置' }}</strong></div><div><span>当前模型</span><code>{{ status?.model || '—' }}</code></div><div><span>前台命令</span><strong>{{ status?.shellEnabled ? '已启用（Docker 隔离）' : '已关闭' }}</strong></div><div><span>服务状态</span><strong>{{ statusLabel }}</strong></div></div><div class="settings-guide"><strong>首次使用</strong><ol><li>按项目 README 配置 PostgreSQL 与后端环境变量。</li><li>设置 <code>ANTHROPIC_API_KEY</code>、<code>MODEL_ID</code>；需要时设置兼容服务的地址。</li><li>启动后端，再点击下方按钮检查连接。</li></ol><p>为了保护密钥，配置需要在本机后端完成。此页面不会展示或保存 API Key。</p></div><template #footer><el-button @click="settingsOpen = false">关闭</el-button><el-button type="primary" :loading="initialLoading" @click="initialize">重新检查连接</el-button></template></el-dialog>
     <el-dialog v-model="fileOpen" :title="openedFile.path" width="min(900px, 94vw)" class="mint-dialog file-dialog"><div v-if="fileLoading" class="loading-state">正在打开文件…</div><pre v-else class="file-preview">{{ openedFile.content }}</pre><template #footer><el-button @click="fileOpen = false">关闭</el-button><el-button :disabled="fileLoading" @click="downloadFile">下载文件</el-button><el-button type="primary" :disabled="fileLoading" @click="copyFile"><Icon name="copy" :size="14" />复制内容</el-button></template></el-dialog>
   </div>
 </template>

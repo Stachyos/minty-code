@@ -1,6 +1,6 @@
 const ACTIVE = new Set(['queued', 'pending', 'running', 'stopping'])
-const STATUS_LABELS = { queued: '排队中', pending: '等待中', running: '进行中', stopping: '正在停止', completed: '已完成', failed: '失败', stopped: '已停止', cancelled: '已停止', interrupted: '未完成', unknown: '未记录' }
-const TOOLS = { bash: '执行命令', read_file: '读取文件', write_file: '创建文件', edit_file: '修改文件', TodoWrite: '更新待办', task_create: '创建任务', task_get: '查看任务', task_update: '更新任务', task_list: '读取任务列表', load_skill: '加载技能', compress: '压缩上下文' }
+const STATUS_LABELS = { queued: '排队中', pending: '等待中', running: '进行中', stopping: '正在停止', completed: '已完成', skipped: '已跳过', failed: '失败', stopped: '已停止', cancelled: '已停止', interrupted: '已中断', budget_exhausted: '预算耗尽', unknown: '未记录' }
+const TOOLS = { bash: '执行命令', read_file: '读取文件', write_file: '创建文件', edit_file: '修改文件', TodoWrite: '更新待办', task_create: '创建任务', task_get: '查看任务', task_update: '更新任务', task_list: '读取任务列表', load_skill: '加载技能', compress: '压缩上下文', update_progress: '更新任务进度', review_step: '回查步骤记录', start_background: '启动后台命令', background_status: '查看后台命令', stop_background: '停止后台命令' }
 
 export const isActiveRun = run => ACTIVE.has(String(run?.status || '').toLowerCase())
 export const stateLabel = state => STATUS_LABELS[String(state || '').toLowerCase()] || state || '等待中'
@@ -38,6 +38,7 @@ export function buildWorkflow(run, rawEvents = []) {
   const phases = new Map()
   const toolsById = new Map()
   const pendingTools = []
+  const backgroundJobs = new Map()
   let currentModel = null
   let legacyText = null
   let fatalError = ''
@@ -45,7 +46,30 @@ export function buildWorkflow(run, rawEvents = []) {
 
   for (const event of events) {
     const data = parseContent(event.content)
-    if (event.type === 'phase') {
+    if (event.type === 'status' && event.content === 'interrupted') {
+      for (const node of nodes.filter(item => item.status === 'running')) {
+        node.status = 'interrupted'
+        node.endedAt = event.createdAt
+      }
+      currentModel = null
+    } else if (event.type === 'background') {
+      let job = backgroundJobs.get(data.jobId)
+      if (!job) {
+        job = { id: `background-${event.id}`, kind: 'background', name: 'background',
+          title: '后台命令', startedAt: event.createdAt, eventIds: [], input: data.command || '', output: '' }
+        backgroundJobs.set(data.jobId, job)
+        nodes.push(job)
+      }
+      job.status = data.status
+      job.endedAt = data.status === 'running' ? null : event.createdAt
+      job.details = data
+      job.output = formatDetail(data)
+      job.eventIds.push(event.id)
+    } else if (event.type === 'recovery') {
+      nodes.push({ id: `recovery-${event.id}`, kind: 'recovery', name: 'recovery', title: '核对恢复检查点',
+        summary: `检测到 ${data.changedCount || 0} 个文件变动`, status: 'completed', details: data,
+        startedAt: event.createdAt, endedAt: event.createdAt, input: '', output: formatDetail(data), eventIds: [event.id] })
+    } else if (event.type === 'phase') {
       const phaseId = data.phaseId || `${data.phase || 'phase'}-${event.id}`
       let node = phases.get(phaseId)
       if (!node) {
@@ -95,11 +119,12 @@ export function buildWorkflow(run, rawEvents = []) {
         nodes.push(node)
       }
       node.output = data.output ?? event.content ?? ''
-      node.status = data.status === 'failed' || data.isError === true || /^Error:/i.test(String(data.output || '')) ? 'failed' : 'completed'
+      node.status = data.status === 'skipped' ? 'skipped'
+        : data.status === 'failed' || data.isError === true || /^Error:/i.test(String(data.output || '')) ? 'failed' : 'completed'
       node.endedAt = event.createdAt; node.eventIds.push(event.id)
     } else if (['hook', 'verification', 'completion_check'].includes(event.type)) {
       nodes.push({ id: `${event.type}-${event.id}`, kind: event.type, name: data.hook || event.type,
-        title: event.type === 'hook' ? `生命周期 · ${{input:'输入',before_tool:'工具前',after_tool:'工具后',stop:'结束'}[data.hook] || data.hook}` : event.type === 'verification' ? '独立验证结果' : '验证后继续修复',
+        title: event.type === 'hook' ? `生命周期 · ${{input:'输入',before_tool:'工具前',after_tool:'工具后',stop:'结束',pause:'暂停',resume:'恢复'}[data.hook] || data.hook}` : event.type === 'verification' ? '独立验证结果' : '验证后继续修复',
         summary: data.reason || '', status: event.type === 'verification' && data.outcome === 'validation_failed' ? 'failed' : 'completed',
         startedAt: event.createdAt, endedAt: event.createdAt, input: '', output: formatDetail(data), details: data, eventIds: [event.id] })
     } else if (event.type === 'error') {
@@ -115,7 +140,10 @@ export function buildWorkflow(run, rawEvents = []) {
       node.endedAt = run.finishedAt || events.at(-1)?.createdAt || null
       if (!node.output) node.output = run.error || fatalError || '运行结束前未收到此步骤的完成事件。'
     }
-    nodes.push({ id: 'result', kind: 'result', title: run.status === 'completed' ? '本次执行结束' : ['stopped', 'cancelled'].includes(run.status) ? '任务已停止' : '任务执行失败', summary: run.error || fatalError || (run.status === 'completed' ? '本次执行已结束' : '运行已停止，已完成的步骤仍保留'), status: run.status, startedAt: run.finishedAt || null, endedAt: run.finishedAt || null, input: '', output: run.error || fatalError || '', eventIds: [] })
+    const title = ({ completed: '本次执行结束', stopped: '任务已停止', cancelled: '任务已停止',
+      interrupted: run.resumable ? '任务中断，可继续' : '任务已中断', budget_exhausted: '任务预算已耗尽' })[run.status] || '任务执行失败'
+    nodes.push({ id: 'result', kind: 'result', title, summary: run.error || fatalError || title,
+      status: run.status, startedAt: run.finishedAt || null, endedAt: run.finishedAt || null, input: '', output: run.error || fatalError || '', eventIds: [] })
   } else if (nodes.length === 1) {
     nodes.push({ id: 'waiting', kind: 'waiting', title: '等待执行事件', summary: '任务已受理，等待执行进度', status: 'running', startedAt: run.createdAt, input: '', output: '', eventIds: [] })
   }

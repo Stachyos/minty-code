@@ -32,6 +32,28 @@ class AssistantIntegrationTest {
                     import json, sys, time
                     from pathlib import Path
                     data = json.load(sys.stdin)
+                    if data['prompt'] == 'complete both files':
+                        workspace = Path(sys.argv[sys.argv.index('--workspace') + 1])
+                        checkpoint = Path(data['checkpointDirectory'])
+                        checkpoint.mkdir(exist_ok=True)
+                        saved = checkpoint / 'state.json'
+                        if data['resume']:
+                            assert json.loads(saved.read_text())['rounds'] == 1
+                            assert (workspace / 'first.txt').read_text() == 'done once'
+                            (workspace / 'second.txt').write_text('done after resume')
+                            rounds = 2
+                        else:
+                            (workspace / 'first.txt').write_text('done once')
+                            rounds = 1
+                        progress = {'rounds': rounds, 'inputTokens': rounds * 12, 'outputTokens': rounds * 7,
+                                    'plan': [{'step': 'first', 'status': 'completed'}]}
+                        saved.write_text(json.dumps(progress))
+                        print(json.dumps({'type':'checkpoint','content':json.dumps(progress)}), flush=True)
+                        if not data['resume']:
+                            time.sleep(30)
+                        print(json.dumps({'type':'recovery','content':json.dumps({'changedCount':0})}), flush=True)
+                        print(json.dumps({'type':'done','content':''}), flush=True)
+                        sys.exit(0)
                     if data['prompt'] == 'slow':
                         time.sleep(30)
                     if data['prompt'] == 'error':
@@ -111,6 +133,52 @@ class AssistantIntegrationTest {
         assertThat(finished.status).isEqualTo("failed");
         assertThat(finished.error).contains("controlled failure");
         assertThat(agent.events(run.id, 0)).filteredOn(e -> e.type.equals("error")).hasSize(1);
+    }
+    @Test void pauseAndResumeKeepOneRunOneUserMessageAndTheOriginalBudget() throws Exception {
+        ChatSession session = agent.createSession(null);
+        AgentRun run = agent.start(session.id, "complete both files");
+        Instant deadline = Instant.now().plusSeconds(6);
+        try {
+            while (agent.requireRun(run.id).roundsUsed == 0 && Instant.now().isBefore(deadline)) Thread.sleep(25);
+            assertThat(agent.requireRun(run.id).roundsUsed).isEqualTo(1);
+        } finally {
+            mvc.perform(post("/api/runs/" + run.id + "/pause")).andExpect(status().isOk());
+        }
+        AgentRun paused = awaitRun(run.id);
+        assertThat(paused.status).isEqualTo("interrupted");
+        assertThat(paused.resumable).isTrue();
+        assertThat(paused.elapsedMillis).isPositive();
+        mvc.perform(post("/api/runs/" + run.id + "/resume")).andExpect(status().isOk()).andExpect(jsonPath("$.id").value(run.id));
+        AgentRun finished = awaitRun(run.id);
+        assertThat(finished.status).isEqualTo("completed");
+        assertThat(finished.roundsUsed).isEqualTo(2);
+        assertThat(finished.inputTokens + finished.outputTokens).isEqualTo(38);
+        assertThat(finished.elapsedMillis).isGreaterThanOrEqualTo(paused.elapsedMillis);
+        assertThat(workspaces.content(session.id, "first.txt").get("content")).isEqualTo("done once");
+        assertThat(workspaces.content(session.id, "second.txt").get("content")).isEqualTo("done after resume");
+        assertThat((List<?>) agent.session(session.id).get("messages")).hasSize(1);
+        assertThat(agent.events(run.id, 0)).extracting(e -> e.type).contains("recovery");
+    }
+    @Test void startupRecoversSavedWorkAndRejectsALegacyRunWithoutCheckpoint() throws Exception {
+        ChatSession session = agent.createSession(null);
+        AgentRun legacy = new AgentRun(session.id, "legacy", "fixture-model");
+        AgentRun run = new AgentRun(session.id, "complete both files", "fixture-model");
+        run.maxRounds = 24;
+        run.roundsUsed = 0;
+        run.maxTokens = 400000;
+        run.timeLimitSeconds = 10;
+        run.elapsedMillis = 0L;
+        run.attemptStartedAt = Instant.now().minusMillis(200);
+        runRepository.saveAll(List.of(legacy, run));
+        Path folder = Files.createDirectory(workspaces.checkpoint(run.id));
+        Files.writeString(folder.resolve("state.json"), "{\"rounds\":1,\"inputTokens\":12,\"outputTokens\":7}");
+        agent.recoverInterruptedRuns();
+        AgentRun recovered = agent.requireRun(run.id);
+        assertThat(recovered.status).isEqualTo("interrupted");
+        assertThat(recovered.resumable).isTrue();
+        assertThat(recovered.roundsUsed).isEqualTo(1);
+        assertThat(recovered.elapsedMillis).isGreaterThanOrEqualTo(200);
+        assertThat(agent.requireRun(legacy.id).status).isEqualTo("failed");
     }
     @Test void recentRunApiIncludesPromptModelAndFiltersBySession() throws Exception {
         ChatSession first = agent.createSession("first session");

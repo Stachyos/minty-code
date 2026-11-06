@@ -4,9 +4,9 @@ import { chapterModules } from './chapterModules.js'
 test('all 17 chapters stay visible with honest integration states',()=>{
  const result=chapterModules([],null)
  assert.equal(result.length,17)
- for(const id of ['s06','s09','s11','s12','s13','s14','s16']) assert.equal(result.find(m=>m.id===id).integration,'unavailable')
- for(const id of ['s03','s10','s15','s17']) assert.equal(result.find(m=>m.id===id).integration,'partial')
- for(const id of ['s01','s02','s04','s05','s07','s08']) assert.equal(result.find(m=>m.id===id).integration,'available')
+ for(const id of ['s06','s09','s12','s13','s14','s16']) assert.equal(result.find(m=>m.id===id).integration,'unavailable')
+ for(const id of ['s03','s15','s17']) assert.equal(result.find(m=>m.id===id).integration,'partial')
+ for(const id of ['s01','s02','s04','s05','s07','s08','s10','s11']) assert.equal(result.find(m=>m.id===id).integration,'available')
  assert.equal(result.find(m=>m.id==='s02').status,'idle')
 })
 test('integration and observed execution remain separate, including tools, hooks and verification',()=>{
