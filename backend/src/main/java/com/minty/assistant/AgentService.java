@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -26,19 +27,21 @@ public class AgentService {
     private final RunRepository runs;
     private final EventRepository events;
     private final WorkspaceService workspaces;
+    private final ProjectService projects;
     private final ObjectMapper json;
     private final ExecutorService workers;
     private final TransactionTemplate transactions;
     private final ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor();
     private final Map<String, Job> jobs = new ConcurrentHashMap<>();
-    private final Map<String, String> activeSessions = new ConcurrentHashMap<>();
+    private final Map<String, String> activeScopes = new ConcurrentHashMap<>();
     @Value("${agent.max-tokens:400000}") private int maxTokens;
 
     AgentService(AgentProperties config, SessionRepository sessions, MessageRepository messages,
                  RunRepository runs, EventRepository events, WorkspaceService workspaces, ObjectMapper json,
-                 PlatformTransactionManager transactionManager, DatabaseHealth database) {
+                 PlatformTransactionManager transactionManager, DatabaseHealth database, ProjectService projects) {
         this.config = config; this.sessions = sessions; this.messages = messages;
         this.database = database;
+        this.projects = projects;
         this.runs = runs; this.events = events; this.workspaces = workspaces; this.json = json;
         this.workers = Executors.newFixedThreadPool(Math.max(1, config.maxConcurrentRuns()));
         this.transactions = new TransactionTemplate(transactionManager);
@@ -75,58 +78,154 @@ public class AgentService {
                 "shellEnabled", config.allowShell(), "maxSteps", config.maxSteps(), "timeoutSeconds", config.timeoutSeconds(),
                 "maxTokens", maxTokens);
     }
-    public List<ChatSession> sessions() { return sessions.findAllByOrderByUpdatedAtDesc(); }
+    public List<ChatSession> sessions() { return sessions.startedSessions(); }
     public ChatSession createSession(String title) {
+        return createSession(title, null, null, null);
+    }
+    public synchronized ChatSession createSession(String title, String mode, String projectId, String workspaceId) {
         String clean = title == null || title.isBlank() ? "新的灵感" : title.strip();
-        return sessions.save(new ChatSession(clean.substring(0, Math.min(clean.length(), 120))));
+        ChatSession session = new ChatSession(clean.substring(0, Math.min(clean.length(), 120)));
+        if ("workspace".equals(mode) && projectId != null) {
+            var workspace = workspaceId == null ? projects.defaultWorkspace(projectId) : projects.workspace(projectId, workspaceId);
+            session.projectId = workspace.projectId();
+            session.workspaceId = workspace.id();
+        } else if ((mode != null && !mode.equals("chat")) || projectId != null || workspaceId != null) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "请选择普通聊天或有效的项目工作区");
+        }
+        session.mode = mode;
+        return sessions.save(session);
     }
     public ChatSession requireSession(String id) {
-        return sessions.findById(id).orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "会话不存在"));
+        return sessions.findByIdAndDeletedAtIsNull(id).orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "会话不存在"));
+    }
+    synchronized void deleteSession(String id) {
+        ChatSession session = requireSession(id);
+        if (jobs.values().stream().anyMatch(job -> id.equals(job.sessionId))) {
+            throw new ApiException(HttpStatus.CONFLICT, "请先停止此聊天正在运行的任务");
+        }
+        session.deletedAt = Instant.now();
+        sessions.save(session);
+    }
+    synchronized ProjectService.ProjectInfo setProjectDirectory(String id, String directory) {
+        checkProjectIdle(id);
+        return projects.setDirectory(id, directory);
+    }
+    synchronized void deleteProject(String id) {
+        checkProjectIdle(id);
+        transactions.executeWithoutResult(transaction -> {
+            Instant when = Instant.now();
+            projects.delete(id, when);
+            sessions.deleteProjectSessions(id, when);
+        });
+    }
+    private void checkProjectIdle(String id) {
+        if (jobs.values().stream().anyMatch(job -> id.equals(job.projectId))) {
+            throw new ApiException(HttpStatus.CONFLICT, "请先停止此项目正在运行的任务");
+        }
     }
     public Map<String, Object> session(String id) {
         ChatSession session = requireSession(id);
-        return Map.of("id", session.id, "title", session.title, "createdAt", session.createdAt,
-                "updatedAt", session.updatedAt, "messages", messages.findBySessionIdOrderByCreatedAtAsc(id));
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("id", session.id);
+        details.put("title", session.title);
+        details.put("createdAt", session.createdAt);
+        details.put("updatedAt", session.updatedAt);
+        details.put("mode", session.mode);
+        details.put("projectId", session.projectId);
+        details.put("workspaceId", session.workspaceId);
+        if (session.projectId != null) {
+            details.put("projectName", projects.get(session.projectId).name());
+            details.put("workspaceName", projects.workspace(session.projectId, session.workspaceId).name());
+        }
+        details.put("latestRun", runs.findFirstBySessionIdOrderByCreatedAtDesc(id).orElse(null));
+        details.put("messages", messages.findBySessionIdOrderByCreatedAtAsc(id));
+        return details;
     }
     public AgentRun latest(String sessionId) { requireSession(sessionId); return runs.findFirstBySessionIdOrderByCreatedAtDesc(sessionId).orElse(null); }
     public List<AgentRun> recentRuns(String sessionId) {
-        if (sessionId == null || sessionId.isBlank()) return runs.findTop50ByOrderByCreatedAtDesc();
+        if (sessionId == null || sessionId.isBlank()) return runs.recentVisible(PageRequest.of(0, 50));
         requireSession(sessionId);
         return runs.findTop50BySessionIdOrderByCreatedAtDesc(sessionId);
     }
-    public AgentRun requireRun(String id) { return runs.findById(id).orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "运行记录不存在")); }
+    public AgentRun requireRun(String id) {
+        AgentRun run = storedRun(id);
+        requireSession(run.sessionId);
+        return run;
+    }
+    private AgentRun storedRun(String id) {
+        return runs.findById(id).orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "运行记录不存在"));
+    }
     public List<RunEvent> events(String id, long after) { requireRun(id); return events.findFirst200ByRunIdAndIdGreaterThanOrderByIdAsc(id, Math.max(0, after)); }
+    public List<RunEvent> eventSummary(String id) {
+        requireRun(id);
+        return events.findFirst200ByRunIdAndTypeInOrderByIdAsc(id, List.of("knowledge", "background", "recovery"));
+    }
     public synchronized Map<String, Object> upload(String sessionId, String path, byte[] bytes) throws IOException {
-        requireSession(sessionId);
-        if (activeSessions.containsKey(sessionId)) throw new ApiException(HttpStatus.CONFLICT, "请先等待或停止任务，再上传文件");
-        return workspaces.upload(sessionId, path, bytes);
+        ChatSession session = fileSession(sessionId);
+        Path workspace = workspace(session, linkedPath(session));
+        checkWorkspaceIdle(session, workspace);
+        return workspaces.upload(workspace, path, bytes);
+    }
+    String fileScope(String sessionId) {
+        return fileSession(sessionId).scopeId();
+    }
+    Path fileWorkspace(String sessionId) throws IOException {
+        ChatSession session = fileSession(sessionId);
+        return workspace(session, linkedPath(session));
+    }
+    Path projectFileWorkspace(String projectId, String workspaceId) throws IOException {
+        var project = projects.get(projectId);
+        if (project.localDirectory() != null) return workspaces.linkedDirectory(project.localDirectory());
+        var workspace = workspaceId == null ? projects.defaultWorkspace(projectId) : projects.workspace(projectId, workspaceId);
+        return workspaces.workspace(workspace.id());
+    }
+    private ChatSession fileSession(String sessionId) {
+        ChatSession session = requireSession(sessionId);
+        if (session.isChat()) throw new ApiException(HttpStatus.CONFLICT, "普通聊天不使用项目文件或任务工具");
+        return session;
+    }
+    private String linkedPath(ChatSession session) {
+        return session.projectId == null ? null : projects.get(session.projectId).localDirectory();
+    }
+    private Path workspace(ChatSession session, String linkedPath) throws IOException {
+        if (session.isChat()) return null;
+        return linkedPath == null ? workspaces.workspace(session.scopeId()) : workspaces.linkedDirectory(linkedPath);
+    }
+    private void checkWorkspaceIdle(ChatSession session, Path workspace) {
+        if (activeScopes.containsKey(session.scopeId()) || (workspace != null && jobs.values().stream().anyMatch(job ->
+                job.workspace != null && (workspace.startsWith(job.workspace) || job.workspace.startsWith(workspace))))) {
+            throw new ApiException(HttpStatus.CONFLICT, "当前会话或目录有任务正在运行，请等待完成或停止任务");
+        }
     }
 
     public synchronized AgentRun start(String sessionId, String prompt) throws IOException {
         ChatSession session = requireSession(sessionId);
-        Path script = checkCanStart(sessionId);
-        Path workspace = workspaces.workspace(sessionId);
-        List<Map<String, String>> history = messages.findBySessionIdOrderByCreatedAtAsc(sessionId).stream()
-                .map(m -> Map.of("role", m.role, "content", m.content)).toList();
+        Path script = checkCanStart(session);
+        String linkedPath = linkedPath(session);
+        Path workspace = workspace(session, linkedPath);
+        checkWorkspaceIdle(session, workspace);
+        var knowledge = session.projectId == null ? List.<ProjectService.ResourceInfo>of() : projects.resources(session.projectId);
+        List<Map<String, String>> history = chatHistory(messages.findBySessionIdOrderByCreatedAtAsc(sessionId));
         if (history.isEmpty() && (session.title.equals("新的灵感") || session.title.equals("新会话"))) {
             session.title = prompt.strip().substring(0, Math.min(prompt.strip().length(), 24));
         }
         session.updatedAt = Instant.now(); sessions.save(session);
         messages.save(new ChatMessage(sessionId, "user", prompt));
         AgentRun run = new AgentRun(sessionId, prompt, config.model());
-        run.maxRounds = Math.min(40, Math.max(1, config.maxSteps()));
+        run.workspacePath = workspace == null ? null : workspace.toString();
+        run.maxRounds = session.isChat() ? 1 : Math.min(40, Math.max(1, config.maxSteps()));
         run.roundsUsed = 0;
         run.maxTokens = Math.max(1, maxTokens);
         run.timeLimitSeconds = Math.max(1, config.timeoutSeconds());
         run.elapsedMillis = 0L;
-        run.progress = "{}";
-        launch(run, script, workspace, history, false);
+        run.progress = session.isChat() ? null : "{}";
+        launch(run, session, script, workspace, linkedPath != null, history, knowledge, false);
         return run;
     }
 
-    private Path checkCanStart(String sessionId) {
+    private Path checkCanStart(ChatSession session) {
         if (!config.configured()) throw new ApiException(HttpStatus.CONFLICT, "请先在服务端配置模型");
-        if (activeSessions.containsKey(sessionId)) throw new ApiException(HttpStatus.CONFLICT, "当前会话有任务正在运行或清理，请稍后再试");
+        if (activeScopes.containsKey(session.scopeId())) throw new ApiException(HttpStatus.CONFLICT, "当前会话或工作区有任务正在运行或清理，请稍后再试");
         if (jobs.size() >= Math.max(1, config.maxConcurrentRuns())) throw new ApiException(HttpStatus.TOO_MANY_REQUESTS, "同时运行的任务已达上限，请稍后再试");
         Path script = Path.of(config.worker()).toAbsolutePath().normalize();
         if (!Files.isRegularFile(script)) throw new ApiException(HttpStatus.SERVICE_UNAVAILABLE, "未找到 Agent worker，请检查 AGENT_WORKER 配置");
@@ -142,7 +241,14 @@ public class AgentService {
         if (!Objects.equals(run.model, config.model())) {
             throw new ApiException(HttpStatus.CONFLICT, "请切回任务原先使用的模型后再继续");
         }
-        Path script = checkCanStart(run.sessionId);
+        ChatSession session = requireSession(run.sessionId);
+        Path script = checkCanStart(session);
+        String linkedPath = linkedPath(session);
+        Path workspace = workspace(session, linkedPath);
+        if (workspace == null || (run.workspacePath == null ? linkedPath != null : !workspace.equals(Path.of(run.workspacePath)))) {
+            throw new ApiException(HttpStatus.CONFLICT, "任务的工作目录已更改，请恢复原目录后再继续");
+        }
+        checkWorkspaceIdle(session, workspace);
         JsonNode checkpoint = savedCheckpoint(id);
         if (checkpoint == null) throw new ApiException(HttpStatus.CONFLICT, "任务检查点无法读取");
         readBudget(run, checkpoint);
@@ -151,29 +257,46 @@ public class AgentService {
             throw new ApiException(HttpStatus.SERVICE_UNAVAILABLE, "无法核对上一次的执行容器，请确认 Docker Linux 引擎已启动");
         }
         run.cleanupPending = false;
-        launch(run, script, workspaces.workspace(run.sessionId), List.of(), true);
+        var knowledge = session.projectId == null ? List.<ProjectService.ResourceInfo>of() : projects.resources(session.projectId);
+        var prior = messages.findBySessionIdOrderByCreatedAtAsc(run.sessionId).stream()
+                .filter(message -> !message.createdAt.isAfter(run.createdAt)).toList();
+        if (!prior.isEmpty()) {
+            ChatMessage last = prior.get(prior.size() - 1);
+            if ("user".equals(last.role) && Objects.equals(last.content, run.prompt)) {
+                prior = prior.subList(0, prior.size() - 1);
+            }
+        }
+        launch(run, session, script, workspace, linkedPath != null, chatHistory(prior), knowledge, true);
         return run;
     }
 
-    private void launch(AgentRun run, Path script, Path workspace, List<Map<String, String>> history, boolean resume) throws IOException {
-        Path checkpoint = workspaces.checkpoint(run.id);
+    private List<Map<String, String>> chatHistory(List<ChatMessage> history) {
+        return history.stream().map(message -> Map.of("role", message.role, "content", message.content)).toList();
+    }
+
+    private void launch(AgentRun run, ChatSession session, Path script, Path workspace, boolean linked, List<Map<String, String>> history,
+                        List<ProjectService.ResourceInfo> knowledge, boolean resume) throws IOException {
+        Path checkpoint = session.isChat() ? null : workspaces.checkpoint(run.id);
+        Path metadata = linked ? workspaces.workspace(session.scopeId()) : null;
         run.status = "running";
         run.attemptStartedAt = Instant.now();
         run.resumable = false;
         run.finishedAt = null;
         run.error = null;
         runs.save(run);
-        Job job = new Job(run.id, run.sessionId);
+        Job job = new Job(run.id, session, workspace);
         job.inputTokens = run.inputTokens;
         job.outputTokens = run.outputTokens;
         jobs.put(run.id, job);
-        activeSessions.put(run.sessionId, run.id);
+        activeScopes.put(job.scopeId, run.id);
         event(run.id, "status", "running");
-        workers.submit(() -> execute(job, run, script, workspace, checkpoint, history, resume));
+        workers.submit(() -> execute(job, run, script, checkpoint, metadata, history, knowledge, resume));
     }
 
-    private void execute(Job job, AgentRun run, Path script, Path workspace, Path checkpoint,
-                         List<Map<String, String>> history, boolean resume) {
+    private void execute(Job job, AgentRun run, Path script, Path checkpoint, Path metadata,
+                         List<Map<String, String>> history, List<ProjectService.ResourceInfo> knowledge, boolean resume) {
+        Path workspace = job.workspace;
+        boolean projectMode = job.projectId != null;
         long remaining = Math.max(1, run.timeLimitSeconds * 1000L - run.elapsedMillis);
         ScheduledFuture<?> timeout = timer.schedule(() -> {
             synchronized (job) {
@@ -188,8 +311,9 @@ public class AgentService {
         try {
             synchronized (job) {
                 if (job.cancelled) return;
-                ProcessBuilder builder = new ProcessBuilder(config.python(), "-u", script.toString(), "--workspace", workspace.toString());
-                builder.directory(workspace.toFile());
+                ProcessBuilder builder = new ProcessBuilder(config.python(), "-u", script.toString());
+                if (workspace != null) builder.command().addAll(List.of("--workspace", workspace.toString()));
+                builder.directory((workspace == null ? script.getParent() : workspace).toFile());
                 builder.environment().put("ANTHROPIC_API_KEY", config.apiKey());
                 builder.environment().put("MODEL_ID", run.model);
                 builder.environment().put("PYTHONIOENCODING", "utf-8");
@@ -208,9 +332,18 @@ public class AgentService {
             }, "agent-stderr-" + job.id);
             errorReader.setDaemon(true); errorReader.start();
             try (Writer input = new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8)) {
-                input.write(json.writeValueAsString(Map.of("prompt", run.prompt, "history", history, "model", run.model,
+                Map<String, Object> request = new LinkedHashMap<>(Map.of("prompt", run.prompt, "history", history, "model", run.model,
                         "maxSteps", run.maxRounds, "maxTokens", run.maxTokens, "runId", job.id,
-                        "checkpointDirectory", checkpoint.toString(), "resume", resume, "supervisorPid", ProcessHandle.current().pid())));
+                        "resume", resume, "supervisorPid", ProcessHandle.current().pid()));
+                if (checkpoint != null) request.put("checkpointDirectory", checkpoint.toString());
+                if (metadata != null) {
+                    request.put("metadataDirectory", metadata.toString());
+                    Path excluded = workspaces.excludedDirectory(workspace);
+                    if (excluded != null) request.put("excludedDirectory", excluded.toString());
+                }
+                request.put("mode", workspace == null ? "chat" : projectMode ? "project" : "legacy");
+                if (projectMode) request.put("projectResources", knowledge);
+                input.write(json.writeValueAsString(request));
                 input.write("\n");
             }
             boolean done = false;
@@ -226,12 +359,12 @@ public class AgentService {
                         String content = redact(node.path("content").isTextual() ? node.path("content").asText() : node.path("content").toString());
                         switch (type) {
                             case "text" -> { job.text.append(content); event(job.id, type, content); }
-                            case "tool_start", "tool_result", "model_start", "model_end", "phase", "hook", "completion_check", "recovery", "background" -> {
+                            case "tool_start", "tool_result", "model_start", "model_end", "phase", "hook", "completion_check", "recovery", "background", "knowledge" -> {
                                 if (type.equals("tool_start") && json.readTree(content).path("name").asText().equals("run_tests")) job.testsUsed = true;
                                 event(job.id, type, content);
                             }
                             case "verification", "changes" -> {
-                                AgentRun observed = requireRun(job.id);
+                                AgentRun observed = storedRun(job.id);
                                 if (type.equals("verification")) observed.verification = content; else observed.changes = content;
                                 runs.save(observed); event(job.id, type, content);
                             }
@@ -241,7 +374,7 @@ public class AgentService {
                                 persistUsage(job);
                             }
                             case "checkpoint" -> {
-                                AgentRun observed = requireRun(job.id);
+                                AgentRun observed = storedRun(job.id);
                                 observed.progress = content;
                                 readBudget(observed, json.readTree(content));
                                 job.inputTokens = observed.inputTokens;
@@ -287,7 +420,7 @@ public class AgentService {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
-            JsonNode saved = savedCheckpoint(job.id);
+            JsonNode saved = checkpoint == null ? null : savedCheckpoint(job.id);
             boolean needsCleanup = job.testsUsed || saved != null && saved.path("dockerUsed").asBoolean();
             job.cleanupPending = needsCleanup && !cleanupExecution(job.id);
             synchronized (this) {
@@ -301,7 +434,7 @@ public class AgentService {
                     }
                 } finally {
                     jobs.remove(job.id);
-                    activeSessions.remove(job.sessionId, job.id);
+                    activeScopes.remove(job.scopeId, job.id);
                 }
             }
         }
@@ -310,6 +443,9 @@ public class AgentService {
         return interrupt(id, "stopped", null);
     }
     public AgentRun pause(String id) {
+        if (requireSession(requireRun(id).sessionId).isChat()) {
+            throw new ApiException(HttpStatus.CONFLICT, "普通聊天可以停止回复");
+        }
         return interrupt(id, "interrupted", "任务已暂停，可从检查点继续");
     }
     private AgentRun interrupt(String id, String status, String reason) {
@@ -332,7 +468,7 @@ public class AgentService {
         if (job.finished) return;
         // Final status must not become visible before the final message and events.
         transactions.executeWithoutResult(tx -> {
-            AgentRun run = requireRun(job.id);
+            AgentRun run = storedRun(job.id);
             run.inputTokens = job.inputTokens;
             run.outputTokens = job.outputTokens;
             if (saved != null) {
@@ -396,7 +532,7 @@ public class AgentService {
         run.finishedAt = end;
     }
     private void persistUsage(Job job) {
-        AgentRun run = requireRun(job.id);
+        AgentRun run = storedRun(job.id);
         run.inputTokens = job.inputTokens; run.outputTokens = job.outputTokens;
         runs.save(run);
     }
@@ -484,13 +620,17 @@ public class AgentService {
         timer.shutdownNow();
     }
     private static class Job {
-        final String id, sessionId;
+        final String id, sessionId, scopeId, projectId;
+        final Path workspace;
         final StringBuilder text = new StringBuilder();
         Process process;
         Instant terminationTime;
         boolean cancelled, finished, testsUsed, cleanupPending;
         String reportedError, terminalStatus, terminalReason;
         long inputTokens, outputTokens;
-        Job(String id, String sessionId) { this.id = id; this.sessionId = sessionId; }
+        Job(String id, ChatSession session, Path workspace) {
+            this.id = id; this.sessionId = session.id; this.scopeId = session.scopeId();
+            this.projectId = session.projectId; this.workspace = workspace;
+        }
     }
 }

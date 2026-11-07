@@ -26,6 +26,7 @@ public class AgentRun {
     public Instant attemptStartedAt;
     public Boolean resumable;
     public Boolean cleanupPending;
+    @Column(columnDefinition = "text") String workspacePath;
     @Column(nullable = false) public Instant createdAt;
     public Instant finishedAt;
     protected AgentRun() {}

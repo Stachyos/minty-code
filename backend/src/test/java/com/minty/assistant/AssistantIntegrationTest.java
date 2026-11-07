@@ -32,12 +32,25 @@ class AssistantIntegrationTest {
                     import json, sys, time
                     from pathlib import Path
                     data = json.load(sys.stdin)
+                    if data.get('mode') == 'chat':
+                        assert '--workspace' not in sys.argv
+                        assert 'checkpointDirectory' not in data and 'projectResources' not in data
+                        print(json.dumps({'type':'text','content':'Plain reply'}), flush=True)
+                        print(json.dumps({'type':'done','content':''}), flush=True)
+                        sys.exit(0)
+                    if data['prompt'] == 'inspect project resources':
+                        assert data['mode'] == 'project'
+                        titles = [item['title'] for item in data['projectResources']]
+                        print(json.dumps({'type':'text','content':','.join(titles)}), flush=True)
+                        print(json.dumps({'type':'done','content':''}), flush=True)
+                        sys.exit(0)
                     if data['prompt'] == 'complete both files':
                         workspace = Path(sys.argv[sys.argv.index('--workspace') + 1])
                         checkpoint = Path(data['checkpointDirectory'])
                         checkpoint.mkdir(exist_ok=True)
                         saved = checkpoint / 'state.json'
                         if data['resume']:
+                            assert data['history'] == [{'role': 'user', 'content': 'Keep the original context'}]
                             assert json.loads(saved.read_text())['rounds'] == 1
                             assert (workspace / 'first.txt').read_text() == 'done once'
                             (workspace / 'second.txt').write_text('done after resume')
@@ -70,8 +83,9 @@ class AssistantIntegrationTest {
                         time.sleep(2)
                     workspace = Path(sys.argv[sys.argv.index('--workspace') + 1])
                     (workspace / 'hello.txt').write_text('hello from agent', encoding='utf-8')
-                    (workspace / '.tasks').mkdir(exist_ok=True)
-                    (workspace / '.tasks' / 'task_1.json').write_text(json.dumps({'id':1,'subject':'Write greeting','status':'completed'}))
+                    state = Path(data['metadataDirectory']) if 'metadataDirectory' in data else workspace
+                    (state / '.tasks').mkdir(exist_ok=True)
+                    (state / '.tasks' / 'task_1.json').write_text(json.dumps({'id':1,'subject':'Write greeting','status':'completed'}))
                     for event in [
                       {'type':'tool_start','content':json.dumps({'name':'write_file','input':{'path':'hello.txt'},'toolUseId':'fixture-tool-1','round':1})},
                       {'type':'tool_result','content':json.dumps({'name':'write_file','output':'OK','toolUseId':'fixture-tool-1','round':1,'status':'completed'})},
@@ -94,6 +108,181 @@ class AssistantIntegrationTest {
     @Autowired MockMvc mvc;
     @Autowired ObjectMapper json;
     @Autowired RunRepository runRepository;
+    @Autowired MessageRepository messageRepository;
+    @Autowired EventRepository eventRepository;
+    @Autowired ProjectService projects;
+
+    @Test void projectSidebarCreatesConversationsInOneDefaultWorkspaceAndKeepsListsLight() throws Exception {
+        var project = projects.create("Sidebar project");
+        var memory = projects.saveResource(project.id(), null, "memory", "Release decision", "Meeting", "Full body", false);
+        String payload = json.writeValueAsString(Map.of("mode", "workspace", "projectId", project.id()));
+        String firstBody = mvc.perform(post("/api/sessions").contentType(MediaType.APPLICATION_JSON).content(payload))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        var first = json.readTree(firstBody);
+        String workspace = first.path("workspaceId").asText();
+        String sessionId = first.path("id").asText();
+        assertThat(workspace).isNotBlank();
+        mvc.perform(post("/api/sessions").contentType(MediaType.APPLICATION_JSON).content(payload))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.workspaceId").value(workspace));
+        assertThat(projects.workspaces(project.id())).hasSize(1);
+        mvc.perform(get("/api/projects/" + project.id() + "/resource-list"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$[0].id").value(memory.id()))
+                .andExpect(jsonPath("$[0].content").doesNotExist());
+        mvc.perform(get("/api/projects/" + project.id() + "/resources/" + memory.id()))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.content").value("Full body"));
+        AgentRun run = new AgentRun(sessionId, "read policy", "fixture-model");
+        run.status = "completed";
+        runRepository.save(run);
+        eventRepository.save(new RunEvent(run.id, "tool_result", "full tool result"));
+        eventRepository.save(new RunEvent(run.id, "knowledge", "retained citation"));
+        mvc.perform(get("/api/sessions/" + sessionId)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.latestRun.id").value(run.id));
+        mvc.perform(get("/api/runs/" + run.id + "/events").param("summary", "true"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(1))
+                .andExpect(jsonPath("$[0].type").value("knowledge"));
+        mvc.perform(get("/api/runs/" + run.id + "/events"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(2));
+    }
+
+    @Test void workspacesShareOnlyTheirOwnProjectResourcesAndKeepFilesSeparate() throws Exception {
+        var project = projects.create("Release project");
+        var unrelated = projects.create("Unrelated");
+        var a = projects.createWorkspace(project.id(), "Source");
+        var b = projects.createWorkspace(project.id(), "Experiments");
+        var doc = projects.saveResource(project.id(), null, "document", "Release policy", "release.md", "Release evidence.", false);
+        var memo = projects.saveResource(project.id(), null, "memory", "Release memory", "", "Use two approvals.", false);
+        projects.saveResource(unrelated.id(), null, "memory", "Other project secret", "", "Independent context.", false);
+        assertThatThrownBy(() -> agent.createSession("Wrong workspace", "workspace", unrelated.id(), a.id()))
+                .isInstanceOf(ApiException.class);
+        assertThatThrownBy(() -> projects.resource(unrelated.id(), doc.id())).isInstanceOf(ApiException.class);
+        ChatSession first = agent.createSession("First", "workspace", project.id(), a.id());
+        ChatSession same = agent.createSession("Same files", "workspace", project.id(), a.id());
+        ChatSession other = agent.createSession("Other files", "workspace", project.id(), b.id());
+        agent.upload(first.id, "unique.txt", new byte[]{65});
+        mvc.perform(get("/api/sessions/" + same.id + "/files/content").param("path", "unique.txt"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.content").value("A"));
+        mvc.perform(get("/api/sessions/" + other.id + "/files/content").param("path", "unique.txt"))
+                .andExpect(status().isNotFound());
+        AgentRun running = agent.start(first.id, "slow");
+        try {
+            assertThatThrownBy(() -> agent.start(same.id, "must wait")).isInstanceOf(ApiException.class);
+            assertThatThrownBy(() -> agent.upload(same.id, "late.txt", new byte[]{66})).isInstanceOf(ApiException.class);
+        } finally {
+            agent.stop(running.id);
+            awaitRun(running.id);
+        }
+        AgentRun run = agent.start(other.id, "inspect project resources");
+        assertThat(awaitRun(run.id).status).isEqualTo("completed");
+        assertThat(agent.events(run.id, 0).stream().filter(e -> e.type.equals("text")).findFirst().orElseThrow().content)
+                .contains("Release policy", "Release memory").doesNotContain("Other project secret");
+        mvc.perform(put("/api/projects/" + project.id() + "/resources/" + memo.id())
+                        .contentType(MediaType.APPLICATION_JSON).content("""
+                                {"kind":"memory","title":"New decision","content":"Approved text","source":"Meeting"}
+                                """))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.title").value("New decision"));
+        mvc.perform(delete("/api/projects/" + project.id() + "/resources/" + memo.id())).andExpect(status().isNoContent());
+        mvc.perform(get("/api/projects/" + project.id() + "/resources/" + memo.id())).andExpect(status().isNotFound());
+    }
+
+    @Test void linkedDirectoryIsUsedByFileEndpointsAndAgentButRetainedOnDelete() throws Exception {
+        Path directory = Files.createTempDirectory(root, "local-source-").toRealPath();
+        Files.writeString(directory.resolve("existing.txt"), "original source");
+        Files.writeString(directory.resolve(".env"), "LOCAL_TEST_FIXTURE=hidden");
+        mvc.perform(post("/api/projects").contentType(MediaType.APPLICATION_JSON)
+                .content(json.writeValueAsString(Map.of("name", "invalid directory", "localDirectory", "relative/path"))))
+                .andExpect(status().isBadRequest());
+        String projectId = json.readTree(mvc.perform(post("/api/projects").contentType(MediaType.APPLICATION_JSON)
+                .content(json.writeValueAsString(Map.of("name", "local project", "localDirectory", "\"" + directory + "\""))))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.localDirectory").value(directory.toString()))
+                .andReturn().getResponse().getContentAsString()).get("id").asText();
+        ChatSession first = agent.createSession("first local chat", "workspace", projectId, null);
+        ChatSession second = agent.createSession("second local chat", "workspace", projectId, null);
+        ChatSession ordinary = agent.createSession("separate chat", "chat", null, null);
+        String projectApi = "/api/projects/" + projectId;
+        String firstApi = "/api/sessions/" + first.id;
+        String secondApi = "/api/sessions/" + second.id;
+        String directoryJson = json.writeValueAsString(Map.of("localDirectory", directory.toString()));
+        var resource = projects.saveResource(projectId, null, "memory", "decision", "", "local", false);
+        mvc.perform(get(projectApi + "/files/content").param("path", "existing.txt"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.content").value("original source"));
+        mvc.perform(get(firstApi + "/files")).andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(1)).andExpect(jsonPath("$[0].path").value("existing.txt"));
+        mvc.perform(get(firstApi + "/files/content").param("path", "existing.txt"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.content").value("original source"));
+        mvc.perform(get(firstApi + "/files/content").param("path", ".env")).andExpect(status().isForbidden());
+        AgentRun running = agent.start(first.id, "observe-live");
+        try {
+            mvc.perform(delete(firstApi)).andExpect(status().isConflict());
+            mvc.perform(delete(projectApi)).andExpect(status().isConflict());
+            mvc.perform(put(projectApi + "/directory").contentType(MediaType.APPLICATION_JSON).content(directoryJson))
+                    .andExpect(status().isConflict());
+        } finally {
+            assertThat(awaitRun(running.id).status).isEqualTo("completed");
+        }
+        assertThat(Files.readString(directory.resolve("hello.txt"))).isEqualTo("hello from agent");
+        assertThat(directory.resolve(".tasks")).doesNotExist();
+        mvc.perform(get(firstApi + "/tasks")).andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].subject").value("Write greeting"));
+        mvc.perform(delete(firstApi)).andExpect(status().isNoContent());
+        mvc.perform(get(firstApi)).andExpect(status().isNotFound());
+        mvc.perform(get("/api/runs/" + running.id)).andExpect(status().isNotFound());
+        assertThat(agent.recentRuns(null)).extracting(r -> r.id).doesNotContain(running.id);
+        mvc.perform(put(projectApi + "/directory").contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.localDirectory").doesNotExist());
+        mvc.perform(get(secondApi + "/files")).andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(0));
+        mvc.perform(put(projectApi + "/directory").contentType(MediaType.APPLICATION_JSON).content(directoryJson))
+                .andExpect(status().isOk());
+        mvc.perform(delete(projectApi)).andExpect(status().isNoContent());
+        mvc.perform(get(secondApi)).andExpect(status().isNotFound());
+        mvc.perform(get(projectApi + "/resources/" + resource.id())).andExpect(status().isNotFound());
+        assertThat(projects.list()).extracting(ProjectService.ProjectInfo::id).doesNotContain(projectId);
+        assertThat(awaitRun(agent.start(ordinary.id, "Hello").id).status).isEqualTo("completed");
+        assertThat(agent.sessions()).extracting(s -> s.id).contains(ordinary.id).doesNotContain(first.id, second.id);
+        assertThat(Files.readString(directory.resolve("existing.txt"))).isEqualTo("original source");
+        assertThat(directory.resolve("hello.txt")).exists();
+    }
+
+    @Test void sidebarListsOnlyChatsWithAUserMessageEvenAfterAnUpload() throws Exception {
+        String projectId = projects.create("draft project").id();
+        ChatSession draft = agent.createSession(null, "workspace", projectId, null);
+        ChatSession plainDraft = agent.createSession(null, "chat", null, null);
+        agent.upload(draft.id, "first.txt", new byte[]{65});
+        assertThat(agent.sessions()).extracting(s -> s.id).doesNotContain(draft.id, plainDraft.id);
+        AgentRun run = agent.start(draft.id, "First message");
+        assertThat(agent.sessions()).extracting(s -> s.id).contains(draft.id).doesNotContain(plainDraft.id);
+        assertThat(agent.requireSession(draft.id).title).isEqualTo("First message");
+        awaitRun(run.id);
+    }
+
+    @Test void folderPickerListsNavigableDirectoriesWithoutFilesOrManagedState() throws Exception {
+        Path location = Files.createTempDirectory(root, "folder-picker-").toRealPath();
+        Path child = Files.createDirectory(location.resolve("Example Folder"));
+        Files.createDirectory(location.resolve(".hidden"));
+        Files.writeString(location.resolve("readme.txt"), "fixture");
+        mvc.perform(get("/api/projects/directories"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.selectable").value(false));
+        mvc.perform(get("/api/projects/directories").param("path", location.toString()))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.selectable").value(true))
+                .andExpect(jsonPath("$.entries.length()").value(1))
+                .andExpect(jsonPath("$.entries[0].path").value(child.toString()));
+        mvc.perform(get("/api/projects/directories").param("path", child.toString()))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.parent").value(location.toString()));
+        mvc.perform(get("/api/projects/directories").param("path", root.resolve("workspaces").toString()))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test void ordinaryChatUsesNoFileScopeOrProjectWorkerContext() throws Exception {
+        String body = mvc.perform(post("/api/sessions").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"title\":\"Plain\",\"mode\":\"chat\"}"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.mode").value("chat"))
+                .andReturn().getResponse().getContentAsString();
+        String id = json.readTree(body).path("id").asText();
+        mvc.perform(get("/api/sessions/" + id + "/files")).andExpect(status().isConflict());
+        assertThatThrownBy(() -> agent.upload(id, "test.txt", new byte[]{65})).isInstanceOf(ApiException.class);
+        AgentRun run = agent.start(id, "Hello");
+        assertThat(awaitRun(run.id).status).isEqualTo("completed");
+        assertThat(Files.exists(root.resolve("workspaces").resolve(id))).isFalse();
+    }
 
     @Test void completeRunPersistsMessagesEventsFilesTasksAndUsage() throws Exception {
         ChatSession session = agent.createSession(null);
@@ -136,6 +325,7 @@ class AssistantIntegrationTest {
     }
     @Test void pauseAndResumeKeepOneRunOneUserMessageAndTheOriginalBudget() throws Exception {
         ChatSession session = agent.createSession(null);
+        messageRepository.save(new ChatMessage(session.id, "user", "Keep the original context"));
         AgentRun run = agent.start(session.id, "complete both files");
         Instant deadline = Instant.now().plusSeconds(6);
         try {
@@ -156,7 +346,8 @@ class AssistantIntegrationTest {
         assertThat(finished.elapsedMillis).isGreaterThanOrEqualTo(paused.elapsedMillis);
         assertThat(workspaces.content(session.id, "first.txt").get("content")).isEqualTo("done once");
         assertThat(workspaces.content(session.id, "second.txt").get("content")).isEqualTo("done after resume");
-        assertThat((List<?>) agent.session(session.id).get("messages")).hasSize(1);
+        assertThat(messageRepository.findBySessionIdOrderByCreatedAtAsc(session.id))
+                .extracting(message -> message.content).containsExactly("Keep the original context", "complete both files");
         assertThat(agent.events(run.id, 0)).extracting(e -> e.type).contains("recovery");
     }
     @Test void startupRecoversSavedWorkAndRejectsALegacyRunWithoutCheckpoint() throws Exception {

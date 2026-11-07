@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip3 install --no-cache-dir -r requirements.txt
-COPY agent.py worker.py agent_context.py coding_tools.py evaluation_worker.py run_checkpoint.py workspace_commands.py /app/
+COPY agent.py worker.py agent_context.py coding_tools.py evaluation_worker.py run_checkpoint.py workspace_commands.py project_knowledge.py /app/
 COPY infra /app/infra
 COPY benchmarks /app/benchmarks
 COPY --from=build /build/target/minty-assistant-0.1.0.jar /app/app.jar

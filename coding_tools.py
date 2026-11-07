@@ -17,6 +17,7 @@ import uuid
 IGNORED = {'node_modules', '__pycache__', 'target', 'dist', 'venv', 'coverage'}
 MAX_FILE = 1_048_576
 MAX_TOTAL = 25_000_000
+ASSET_SUFFIXES = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.woff', '.woff2', '.ttf', '.pdf'}
 TEST_IMAGE = 'minty-coding-tests:1'
 
 
@@ -34,6 +35,8 @@ TOOL_SCHEMAS = [
            {'path': {'type': 'string'}, 'start_line': {'type': 'integer', 'minimum': 1}, 'end_line': {'type': 'integer', 'minimum': 1}, 'limit': {'type': 'integer', 'minimum': 1}}, ['path']),
     schema('write_file', 'Create or replace a visible workspace file. Prefer apply_patch with expected_sha256 for existing files.',
            {'path': {'type': 'string'}, 'content': {'type': 'string'}}, ['path', 'content']),
+    schema('create_directory', 'Ensure a visible relative workspace directory exists, including missing parents. Use this for empty folders. If already present, return success without modifying it.',
+           {'path': {'type': 'string'}}, ['path']),
     schema('edit_file', 'Replace one unique exact text match. Rejects ambiguous matches.',
            {'path': {'type': 'string'}, 'old_text': {'type': 'string'}, 'new_text': {'type': 'string'}}, ['path', 'old_text', 'new_text']),
     schema('apply_patch', 'Apply guarded changes to multiple files. Read existing files first and supply their sha256. old_text must match exactly once. For new files old_text=null; to delete a file new_text=null and old_text must equal the whole file. All changes validate before writing.',
@@ -48,11 +51,15 @@ TOOL_SCHEMAS = [
 
 
 def visible(path):
-    return not any(part.startswith('.') or part in IGNORED for part in Path(path).parts) and not str(path).endswith(('.pyc', '.pem', '.key', '.p12', '.pfx'))
+    return not any(part.startswith('.') or part.casefold() in IGNORED or ':' in part for part in Path(path).parts) and not str(path).lower().endswith(('.pyc', '.pem', '.key', '.p12', '.pfx'))
 
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+class WorkspaceWriteDenied(ValueError):
+    pass
 
 
 class LifecycleHooks:
@@ -73,8 +80,9 @@ class LifecycleHooks:
 
 
 class CodingTools:
-    def __init__(self, workspace, run_id=None, notify=None, capture_baseline=True, scratch_root=None):
+    def __init__(self, workspace, run_id=None, notify=None, capture_baseline=True, scratch_root=None, excluded_directory=None):
         self.root = Path(workspace).resolve()
+        self.excluded_directory = Path(excluded_directory) if excluded_directory else None
         self.run_id = run_id or str(uuid.uuid4())
         if not re.fullmatch(r'[a-zA-Z0-9-]{1,80}', self.run_id):
             raise ValueError('Invalid run id')
@@ -92,6 +100,8 @@ class CodingTools:
         if relative.is_absolute() or PureWindowsPath(value).drive or '..' in relative.parts or not visible(relative):
             raise ValueError('Only visible relative workspace paths are allowed')
         candidate = self.root / relative
+        if self.excluded_directory is not None and candidate.is_relative_to(self.excluded_directory):
+            raise ValueError('This directory contains application data')
         cursor = self.root
         for part in relative.parts:
             cursor /= part
@@ -106,22 +116,30 @@ class CodingTools:
         self.scan_truncated = False
         result = {}; size = 0
         for directory, dirs, names in os.walk(self.root, followlinks=False):
-            dirs[:] = sorted(name for name in dirs if visible(name) and not (Path(directory) / name).is_symlink()
+            dirs[:] = sorted(name for name in dirs if visible(name) and Path(directory) / name != self.excluded_directory
+                             and not (Path(directory) / name).is_symlink()
                              and not getattr(Path(directory) / name, 'is_junction', lambda: False)())
             for name in sorted(names):
                 relative = (Path(directory) / name).relative_to(self.root).as_posix()
-                if not visible(relative):
+                if not visible(relative) or (Path(directory) / name).is_symlink():
                     continue
                 path = self.path(relative)
                 if not path.is_file():
                     continue
-                if path.stat().st_size > MAX_FILE:
+                file_size = path.stat().st_size
+                if file_size > MAX_FILE and path.suffix.lower() not in ASSET_SUFFIXES:
                     if strict: raise ValueError(f'File exceeds 1 MB workspace tool limit: {relative}')
                     self.scan_truncated = True
                     continue
-                data = path.read_bytes(); size += len(data)
-                if size > MAX_TOTAL or len(result) >= 2000:
+                if size + file_size > MAX_TOTAL or len(result) >= 2000:
                     if strict: raise ValueError('Workspace exceeds the 25 MB / 2000 file tool limit')
+                    self.scan_truncated = True
+                    return result
+                with path.open('rb') as source:
+                    data = source.read(MAX_TOTAL - size + 1)
+                size += len(data)
+                if size > MAX_TOTAL:
+                    if strict: raise ValueError('Workspace exceeds the 25 MB tool limit')
                     self.scan_truncated = True
                     return result
                 result[relative] = data
@@ -156,7 +174,8 @@ class CodingTools:
         return {'ok': True, 'matches': hits, 'truncated': self.scan_truncated}
 
     def read_file(self, path, start_line=1, end_line=None, limit=None):
-        data = self.path(path).read_bytes()
+        with self.path(path).open('rb') as source:
+            data = source.read(MAX_FILE + 1)
         if len(data) > MAX_FILE or b'\0' in data:
             raise ValueError('Only UTF-8 text files up to 1 MB can be read')
         text = data.decode('utf-8'); lines = text.splitlines()
@@ -167,14 +186,41 @@ class CodingTools:
 
     @staticmethod
     def atomic_write(path, data):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handle, temporary = tempfile.mkstemp(prefix='.minty-write-', dir=path.parent)
+        path = Path(path)
         try:
-            with os.fdopen(handle, 'wb') as output:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except PermissionError as exc:
+            raise WorkspaceWriteDenied(f'Cannot write {path}: {exc}. Check that the workspace folder is writable') from None
+        # Exclusive create instead of tempfile.mkstemp: on Windows mkstemp treats a
+        # permission failure in an existing folder as a name collision and retries
+        # until TMP_MAX, which can spin for a very long time on a read-only folder.
+        temporary = path.parent / f'.minty-write-{uuid.uuid4().hex}.tmp'
+        try:
+            with temporary.open('xb') as output:
                 output.write(data)
             os.replace(temporary, path)
+        except PermissionError as exc:
+            raise WorkspaceWriteDenied(f'Cannot write {path}: {exc}. Check that the workspace folder is writable') from None
         finally:
-            if os.path.exists(temporary): os.unlink(temporary)
+            if temporary.exists():
+                try: temporary.unlink()
+                except OSError: pass
+
+    def create_directory(self, path):
+        target = self.path(path)
+        created = False
+        try:
+            if not target.is_dir():
+                target.mkdir(parents=True)
+                created = True
+        except FileExistsError:
+            if not target.is_dir():
+                raise ValueError('A file already exists at the requested directory path') from None
+        except PermissionError as exc:
+            raise WorkspaceWriteDenied(f'Cannot create {path}: {exc}. Check that the workspace folder is writable') from None
+        if self.path(path) != target or not target.is_dir():
+            raise ValueError('Could not verify the workspace directory')
+        return {'ok': True, 'path': target.relative_to(self.root).as_posix(), 'created': created, 'directoryExists': True}
 
     def apply_patch(self, changes):
         if not isinstance(changes, list) or not 1 <= len(changes) <= 30:
@@ -378,7 +424,7 @@ class CodingTools:
 
     @property
     def handlers(self):
-        return {name: getattr(self, name) for name in ('list_files', 'search_text', 'read_file', 'write_file', 'edit_file', 'apply_patch', 'get_diff', 'run_tests')}
+        return {name: getattr(self, name) for name in ('list_files', 'search_text', 'read_file', 'write_file', 'create_directory', 'edit_file', 'apply_patch', 'get_diff', 'run_tests')}
 
 
 def is_test_path(path):

@@ -21,6 +21,30 @@ def tool(name, number, **arguments):
 
 
 class ResumeTest(unittest.TestCase):
+    def test_legacy_checkpoint_restores_prior_chat_without_duplicating_latest_prompt(self):
+        with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(folder).resolve()
+            workspace, directory = root / 'work', root / 'state'
+            workspace.mkdir()
+            directory.mkdir()
+            request = {'prompt': '再重新试一遍', 'model': 'fixture', 'history': [
+                {'role': 'user', 'content': '创建喵喵喵目录'}]}
+            checkpoint = RunCheckpoint(directory, request, CodingTools(workspace), worker.emit_detail)
+            checkpoint.save_messages([{'role': 'user', 'content': request['prompt']}], 0)
+            resumed = {**request, 'resume': True}
+            coding = CodingTools(workspace, capture_baseline=False)
+            checkpoint = RunCheckpoint(directory, resumed, coding, worker.emit_detail)
+            core = fixtures.WorkerTest().core(workspace, iter([Stream(response([]))]), None)
+            observed = []
+            delegate = core.client.messages.stream
+            def observe(**arguments):
+                observed.extend(arguments['messages'])
+                return delegate(**arguments)
+            core.client.messages.stream = observe
+            worker.execute(resumed, core, workspace, coding=coding, checkpoint=checkpoint)
+            self.assertIn(request['history'][0], observed)
+            self.assertEqual(1, observed.count({'role': 'user', 'content': request['prompt']}))
+
     def test_disconnect_keeps_goal_and_completed_writes_and_resumes_the_same_budget(self):
         with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()) as stream:
             root = Path(folder).resolve()

@@ -5,9 +5,9 @@ const specs = [
  ['s04','生命周期 Hooks','available','记录输入、工具前后、结束、暂停与恢复。恢复事件记录文件核对的结果。'],
  ['s05','待办计划','available','支持 TodoWrite 与持久化任务计划，可在恢复后继续更新。'],
  ['s06','子代理','unavailable','底层保留子代理代码；当前工作台和评测没有开放子代理工具。'],
- ['s07','技能加载','available','已接入工作区 skills 目录的按名称加载；没有配置技能时不会虚构内容。'],
+ ['s07','技能加载','available','按名称加载已确认的共享项目技能，兼容工作区 skills 目录。'],
  ['s08','上下文压缩','available','工作台保留原始目标、计划、约束和步骤证据，按相关性选取历史，并可回查工具原始记录。'],
- ['s09','长期记忆','unavailable','跨会话知识检索与长期记忆尚未接入；聊天保存不等于长期记忆。'],
+ ['s09','长期记忆','available','项目记忆可查看、编辑和移除。同一项目的会话可检索相关记忆并查看引用来源。'],
  ['s10','任务系统','available','单任务持久保存目标、约束、计划、进度和预算，支持暂停和从检查点继续。'],
  ['s11','后台任务','available','工作台可启动、查询和停止隔离后台命令，浏览器关闭后服务仍执行并记录结果。'],
  ['s12','定时调度','unavailable','Cron 定时任务尚未接入。'],
@@ -28,6 +28,7 @@ export function chapterModules(stages = [], runStatus, nodes = null) {
    if (id === 's05') return ['TodoWrite','update_progress'].includes(entry.name)
    if (id === 's07') return entry.name === 'load_skill'
    if (id === 's08') return entry.phase === 'compact' || ['compress','compact'].includes(entry.name)
+   if (id === 's09') return entry.kind === 'knowledge' && entry.details?.sources?.some(source => source.kind === 'memory')
    if (id === 's10') return entry.kind === 'recovery' || ['task_create','task_get','task_update','task_list','update_progress','review_step'].includes(entry.name)
    if (id === 's11') return entry.kind === 'background' || ['start_background','background_status','stop_background'].includes(entry.name)
    if (id === 's17') return ['verification','completion_check','recovery'].includes(entry.kind)

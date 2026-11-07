@@ -1,6 +1,6 @@
 const ACTIVE = new Set(['queued', 'pending', 'running', 'stopping'])
 const STATUS_LABELS = { queued: '排队中', pending: '等待中', running: '进行中', stopping: '正在停止', completed: '已完成', skipped: '已跳过', failed: '失败', stopped: '已停止', cancelled: '已停止', interrupted: '已中断', budget_exhausted: '预算耗尽', unknown: '未记录' }
-const TOOLS = { bash: '执行命令', read_file: '读取文件', write_file: '创建文件', edit_file: '修改文件', TodoWrite: '更新待办', task_create: '创建任务', task_get: '查看任务', task_update: '更新任务', task_list: '读取任务列表', load_skill: '加载技能', compress: '压缩上下文', update_progress: '更新任务进度', review_step: '回查步骤记录', start_background: '启动后台命令', background_status: '查看后台命令', stop_background: '停止后台命令' }
+const TOOLS = { bash: '执行命令', read_file: '读取文件', write_file: '创建文件', create_directory: '创建文件夹', edit_file: '修改文件', TodoWrite: '更新待办', task_create: '创建任务', task_get: '查看任务', task_update: '更新任务', task_list: '读取任务列表', load_skill: '加载技能', compress: '压缩上下文', update_progress: '更新任务进度', review_step: '回查步骤记录', start_background: '启动后台命令', background_status: '查看后台命令', stop_background: '停止后台命令' }
 
 export const isActiveRun = run => ACTIVE.has(String(run?.status || '').toLowerCase())
 export const stateLabel = state => STATUS_LABELS[String(state || '').toLowerCase()] || state || '等待中'
@@ -65,6 +65,10 @@ export function buildWorkflow(run, rawEvents = []) {
       job.details = data
       job.output = formatDetail(data)
       job.eventIds.push(event.id)
+    } else if (event.type === 'knowledge') {
+      nodes.push({ id: `knowledge-${event.id}`, kind: 'knowledge', title: '检索项目资料',
+        summary: `命中 ${data.sources?.length || 0} 个片段`, status: 'completed', details: data,
+        startedAt: event.createdAt, endedAt: event.createdAt, input: '', output: formatDetail(data), eventIds: [event.id] })
     } else if (event.type === 'recovery') {
       nodes.push({ id: `recovery-${event.id}`, kind: 'recovery', name: 'recovery', title: '核对恢复检查点',
         summary: `检测到 ${data.changedCount || 0} 个文件变动`, status: 'completed', details: data,
@@ -94,7 +98,9 @@ export function buildWorkflow(run, rawEvents = []) {
       hasModelEvents = true
       const node = models.get(String(data.round)) || currentModel
       if (node) {
-        node.status = 'completed'; node.endedAt = event.createdAt; node.eventIds.push(event.id)
+        node.status = data.status === 'failed' ? 'failed' : 'completed'
+        node.endedAt = event.createdAt; node.eventIds.push(event.id)
+        if (data.reason) node.summary = data.reason + (data.retryMode === 'same' ? '自动重试。' : data.retrying ? '改用一次性接收。' : '')
         node.inputTokens = data.inputTokens ?? null; node.outputTokens = data.outputTokens ?? null
       }
     } else if (event.type === 'text') {

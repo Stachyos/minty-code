@@ -3,6 +3,7 @@ defineProps({ name: String, size: { type: [Number, String], default: 20 } })
 const paths = {
   leaf: 'M12 21v-7M12 16C3 17 2 7 3 3c7-1 12 5 9 13Zm0 0C11 7 16 3 22 4c0 7-3 12-10 12Z',
   plus: 'M12 5v14M5 12h14',
+  compose: 'M12 5H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7M10 14l4-1 7-7-3-3-7 7-1 4Z',
   chat: 'M21 11.5a8.5 8.5 0 0 1-8.5 8.5H4l-2 2V11.5a9.5 9.5 0 0 1 19 0ZM7 9h10M7 13h6',
   grid: 'M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z',
   chart: 'M4 3v18h18M9 16v-5M14 16V7M19 16V4',

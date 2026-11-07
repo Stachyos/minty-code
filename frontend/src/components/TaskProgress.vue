@@ -39,7 +39,7 @@ const number = value => Number(value || 0).toLocaleString('zh-CN')
 </script>
 
 <template>
-  <section v-if="run?.maxRounds" class="task-state" aria-label="任务进度与预算">
+  <section v-if="run?.maxRounds" class="task-progress-panel" aria-label="任务进度与预算">
     <div class="task-heading">
       <button class="task-toggle" :aria-expanded="open" @click="open = !open">任务进度与预算 {{ open ? '▴' : '▾' }}</button>
       <span v-if="progress.plan?.length">{{ completed }}/{{ progress.plan.length }} 步</span>
@@ -75,7 +75,7 @@ const number = value => Number(value || 0).toLocaleString('zh-CN')
 </template>
 
 <style scoped>
-.task-state { margin: 8px 24px 0; padding: 9px 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); font-size: 12px; }
+.task-progress-panel { margin: 8px 24px 0; padding: 9px 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); font-size: 12px; }
 .task-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; color: var(--muted); }
 .task-toggle { font-weight: 600; color: var(--ink); }
 .task-actions { margin-left: auto; color: var(--mint-deep); }
@@ -87,5 +87,5 @@ const number = value => Number(value || 0).toLocaleString('zh-CN')
 .task-budget { display: flex; gap: 8px 18px; flex-wrap: wrap; }
 .task-budget dt { font-weight: 600; }
 .task-budget dd { margin: 0; color: var(--muted); }
-@media (max-width: 760px) { .task-state { margin-inline: 12px; } }
+@media (max-width: 760px) { .task-progress-panel { margin-inline: 12px; } }
 </style>

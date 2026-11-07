@@ -50,6 +50,55 @@ class CodingToolsTest(unittest.TestCase):
                 tools.apply_patch([{'path':name,'old_text':name,'new_text':'new','expected_sha256':digest(name.encode())} for name in ('a','b')])
             self.assertEqual('a',(root/'a').read_text()); self.assertEqual('b',(root/'b').read_text())
 
+    def test_atomic_write_does_not_use_mkstemp_retry_loop(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target=Path(folder)/'file.txt'
+            with patch('tempfile.mkstemp',side_effect=AssertionError('mkstemp must not be used')):
+                CodingTools.atomic_write(target,b'data')
+            self.assertEqual(b'data',target.read_bytes())
+
+    def test_atomic_write_reports_permission_denied_without_retrying(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target=Path(folder)/'blocked.txt'
+            with patch('pathlib.Path.open',side_effect=PermissionError(13,'Access denied')):
+                with self.assertRaisesRegex(ValueError,'writable'):
+                    CodingTools.atomic_write(target,b'data')
+            self.assertFalse(target.exists())
+
+    def test_worker_creates_empty_directory_and_reports_evidence(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workspace = Path(folder).resolve()
+            tools = CodingTools(workspace)
+            call = Block(type='tool_use', id='folder', name='create_directory', input={'path': '喵喵喵'})
+            streams = iter([Stream(response([call], 'tool_use')), Stream(response([]))])
+            core = fixtures.WorkerTest().core(workspace, streams, None)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                worker.execute({'prompt': '创建一个空文件夹'}, core, workspace, coding=tools)
+            events = [json.loads(line) for line in output.getvalue().splitlines()]
+            result = json.loads(next(e['content'] for e in events if e['type'] == 'tool_result'))
+            self.assertEqual('completed', result['status'])
+            self.assertTrue(json.loads(result['output'])['directoryExists'])
+            self.assertEqual([], list((workspace / '喵喵喵').iterdir()))
+            self.assertFalse(tools.create_directory('喵喵喵')['created'])
+            with self.assertRaises(ValueError):
+                tools.create_directory('../outside')
+
+    def test_worker_stops_on_directory_permission_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workspace = Path(folder).resolve()
+            tools = CodingTools(workspace)
+            call = Block(type='tool_use', id='folder', name='create_directory', input={'path': 'blocked'})
+            core = fixtures.WorkerTest().core(workspace, iter([Stream(response([call], 'tool_use'))]), None)
+            output = io.StringIO()
+            with patch.object(Path, 'mkdir', side_effect=PermissionError('Access denied')), contextlib.redirect_stdout(output):
+                with self.assertRaisesRegex(RuntimeError, '拒绝写入'):
+                    worker.execute({'prompt': '创建一个空文件夹'}, core, workspace, coding=tools)
+            events = [json.loads(line) for line in output.getvalue().splitlines()]
+            result = json.loads(next(e['content'] for e in events if e['type'] == 'tool_result'))
+            self.assertEqual('failed', result['status'])
+            self.assertEqual(1, sum(e['type'] == 'model_start' for e in events))
+
     def test_diff_includes_new_deleted_and_modified_files_without_git(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder); (root/'gone').write_text('gone\n'); (root/'edit').write_text('before\n'); tools=CodingTools(root)

@@ -28,7 +28,7 @@ function stageIdFor(node, eventById) {
   }
   if (node.kind === 'hook') return node.name === 'input' ? 'input' : node.name === 'stop' ? 'output' : 'tools'
   if (node.kind === 'verification') return 'output'
-  if (node.kind === 'completion_check') return 'context'
+  if (node.kind === 'completion_check' || node.kind === 'knowledge') return 'context'
   return { request: 'input', model: 'model', tool: 'tools', reply: 'output', result: 'output' }[node.kind] || null
 }
 
